@@ -22,14 +22,14 @@ _thread_local = threading.local()
 class FusionOp(object):
 
     def __init__(self, name, operation, param_names,
-                 nin, nout, in_vars, out_vars, types, num):
+                 nin, nout, in_refs, out_refs, types, num):
         self.name = name
         self.operation = operation
         self.param_names = param_names
         self.nin = nin
         self.nout = nout
-        self.in_vars = in_vars
-        self.out_vars = out_vars
+        self.in_refs = in_refs
+        self.out_refs = out_refs
         self.types = types
         self.num = num
 
@@ -39,8 +39,8 @@ class FusionOp(object):
 
     def build_kernel_name(self):
         return self.name + '_' + '_'.join([
-            'IN_' + '_'.join(build_kernel_name(_) for _ in self.in_vars),
-            'OUT_' + '_'.join(build_kernel_name(_) for _ in self.out_vars),
+            'IN_' + '_'.join(build_kernel_name(_) for _ in self.in_refs),
+            'OUT_' + '_'.join(build_kernel_name(_) for _ in self.out_refs),
         ])
 
 
@@ -58,44 +58,80 @@ class _FusionVar(object):
     def build_kernel_name(self):
         return self.ty.name + '_at' + str(self.num)
 
+    def get_declaration(self):
+        if self.const is None:
+            return '%s v%d;\n' % (_dtype_to_ctype[self.ty], self.num)
+        else:
+            return 'const %s v%d = %s;\n' % (
+                _dtype_to_ctype[self.ty],
+                self.num,
+                _const_to_str(self.const))
+
 
 class _FusionMem(object):
 
-    def __init__(self, var_list):
+    def __init__(self):
         self.op_list = []
-        self.var_list = var_list[:]
+        self.var_list = []
 
     def __repr__(self):
         return "<_FusionMem, op_list={}, var_list={}>".format(
             self.op_list,
             self.var_list)
 
+    @property
+    def n_vars(self):
+        return len(self.var_list)
+
     def get_fresh(self, ty, **kwargs):
-        n = len(self.var_list)
-        ret = _FusionVar(n, ty, **kwargs)
+        ret = _FusionVar(self.n_vars, ty, **kwargs)
         self.var_list.append(ret)
         return ret
 
     def set_op(self, name, operation, param_names,
-               nin, nout, in_vars, out_vars, types):
+               nin, nout, in_refs, out_refs, types):
         num = len(self.op_list)
         op = FusionOp(name, operation, param_names,
-                      nin, nout, in_vars, out_vars, types, num)
+                      nin, nout, in_refs, out_refs, types, num)
         self.op_list.append(op)
+
+    def get_var_declarations(self, range_):
+        start, end = range_
+        if end is None:
+            end = self.n_vars
+        return [self.var_list[_].get_declaration() for _ in six.moves.range(start, end)]
 
 
 class _FusionRef(object):
 
     def __init__(self, var, mem):
-        self._var = var
+        self.var = var
         self.dtype = var.ty
         self._mem = mem
+
+        self.ty = var.ty
+        self.const = var.const
+        self.num = var.num
+
+    @classmethod
+    def from_arg(cls, arg, mem):
+        if isinstance(arg, _FusionRef):
+            assert mem is arg._mem
+            return arg
+        else:
+            var = _normalize_arg(arg, mem)
+            return _FusionRef(var, mem)
+
+    @classmethod
+    def from_type(cls, ty, mem):
+        var = mem.get_fresh(ty)
+        return _FusionRef(var, mem)
 
     def __repr__(self):
         return "<_FusionRef, dtype=%s>" % self.dtype
 
     def build_kernel_name(self):
-        return build_kernel_name(self._var)
+        return build_kernel_name(self.var)
 
     def __neg__(self):
         return negative(self)
@@ -293,12 +329,12 @@ def _convert(f):
     raise Exception("Can't convert from %s to FusionOp" % type(f))
 
 
-def _should_use_min_scalar(in_args):
+def _should_use_min_scalar(in_refs):
     max_array_kind = -2
     max_scalar_kind = -1
-    for i in in_args:
-        kind = _kind_score[i.ty.kind]
-        if i.const is None:
+    for ref in in_refs:
+        kind = _kind_score[ref.ty.kind]
+        if ref.const is None:
             max_array_kind = max(max_array_kind, kind)
         else:
             max_scalar_kind = max(max_scalar_kind, kind)
@@ -316,63 +352,63 @@ def _convert_from_ufunc(ufunc):
                 return i._mem
         raise Exception('number of ndarray arguments must be more than 0')
 
-    def can_cast1(args, ty_ins):
+    def can_cast1(refs, ty_ins):
         for i in six.moves.range(nin):
-            if args[i].const is None:
-                if not numpy.can_cast(args[i].ty, ty_ins[i]):
+            if refs[i].const is None:
+                if not numpy.can_cast(refs[i].ty, ty_ins[i]):
                     return False
             else:
-                if not numpy.can_cast(args[i].const, ty_ins[i]):
+                if not numpy.can_cast(refs[i].const, ty_ins[i]):
                     return False
         return True
 
-    def can_cast2(args, ty_ins):
+    def can_cast2(refs, ty_ins):
         for i in six.moves.range(nin):
-            if not numpy.can_cast(args[i].ty, ty_ins[i]):
+            if not numpy.can_cast(refs[i].ty, ty_ins[i]):
                 return False
         return True
 
     def res(*args, **kwargs):
         mem = get_mem(args)
-        var_list = [_normalize_arg(_, mem) for _ in args]
+        ref_list = [_FusionRef.from_arg(_, mem) for _ in args]
         if 'out' in kwargs:
-            var_list.append(_normalize_arg(kwargs.pop('out'), mem))
+            ref_list.append(_FusionRef.from_arg(kwargs.pop('out'), mem))
         if kwargs:
             raise TypeError('Wrong arguments %s' % kwargs)
-        assert nin <= len(var_list) <= nin + nout
-        in_vars = var_list[:nin]
-        out_vars = var_list[nin:]
-        can_cast = can_cast1 if _should_use_min_scalar(in_vars) else can_cast2
+        assert nin <= len(ref_list) and len(ref_list) <= nin + nout
+        in_refs = ref_list[:nin]
+        out_refs = ref_list[nin:]
+        can_cast = can_cast1 if _should_use_min_scalar(in_refs) else can_cast2
         for ty_ins, ty_outs, op in ufunc._ops:
             ty_ins = [numpy.dtype(_) for _ in ty_ins]
             ty_outs = [numpy.dtype(_) for _ in ty_outs]
-            if can_cast(in_vars, ty_ins):
+            if can_cast(in_refs, ty_ins):
                 param_names = (['in%d' % i for i in six.moves.range(nin)] +
                                ['out%d' % i for i in six.moves.range(nout)])
                 ret = []
                 for i in six.moves.range(nout):
-                    if i >= len(out_vars):
-                        v = mem.get_fresh(ty_outs[i])
-                        out_vars.append(v)
-                        ret.append(_FusionRef(v, mem))
-                    elif numpy.can_cast(ty_outs[i], out_vars[i].ty,
+                    if i >= len(out_refs):
+                        ref = _FusionRef.from_type(ty_outs[i], mem)
+                        out_refs.append(ref)
+                        ret.append(ref)
+                    elif numpy.can_cast(ty_outs[i], out_refs[i].ty,
                                         "same_kind"):
-                        v = out_vars[i]
-                        ret.append(_FusionRef(v, mem))
+                        ref = _FusionRef(out_refs[i].var, mem)
+                        ret.append(ref)
                     else:
                         raise TypeError(
                             'output (typecode \'{}\') could not be coerced '
                             'to provided output parameter (typecode \'{}\') '
                             'according to the casting rule '
                             '"same_kind"'.format(
-                                ty_outs[i].char, out_vars[i].ty.char))
+                                in_refs[i].ty.char, out_refs[i].ty.char))
                 mem.set_op(ufunc.name, op, param_names, nin, nout,
-                           in_vars, out_vars, ty_ins + ty_outs)
+                           in_refs, out_refs, ty_ins + ty_outs)
                 return ret[0] if len(ret) == 1 else tuple(ret)
         raise TypeError('Invalid type cast in \'{}\': {} -> {}'.format(
             ufunc.name,
-            [_.ty for _ in in_vars],
-            [_.ty for _ in out_vars]))
+            [_.ty for _ in in_refs],
+            [_.ty for _ in out_refs]))
     return res
 
 
@@ -384,22 +420,12 @@ def _gather_submodules(ops):
     return {(op.name, tuple(op.types)): op for op in ops}
 
 
-def _get_params(var_list):
-    return ['%s v%d' % (var.ty, var.num) for var in var_list]
+def _get_params(ref_list):
+    return ['%s v%d' % (ref.ty, ref.num) for ref in ref_list]
 
 
 def _get_out_params(var_list):
     return ['%s ret%d' % (var.ty, i) for i, var in enumerate(var_list)]
-
-
-def _get_declaration_from_var(var):
-    if var.const is None:
-        return '%s v%d;\n' % (_dtype_to_ctype[var.ty], var.num)
-    else:
-        return 'const %s v%d = %s;\n' % (
-            _dtype_to_ctype[var.ty],
-            var.num,
-            _const_to_str(var.const))
 
 
 def _get_declaration_from_op(op):
@@ -408,14 +434,14 @@ def _get_declaration_from_op(op):
 
 
 def _get_operation_code(op):
-    code = ''.join('v%d_%d = v%d;\n' % (op.num, i, v.num)
-                   for i, v in enumerate(op.in_vars))
+    code = ''.join('v%d_%d = v%d;\n' % (op.num, i, r.num)
+                   for i, r in enumerate(op.in_refs))
     params = ['v%d_%d' % (op.num, i)
               for i in six.moves.range(op.nin + op.nout)]
     code += op.name + '(' + ', '.join(params) + ');\n'
     code += ''.join('v%d = v%d_%d;\n' %
-                    (v.num, op.num, i + op.nin)
-                    for i, v in enumerate(op.out_vars))
+                    (r.num, op.num, i + op.nin)
+                    for i, r in enumerate(op.out_refs))
     return code
 
 
@@ -440,11 +466,11 @@ def _get_submodule_code(op):
     return module_code + '\n'
 
 
-def _get_pre_code(in_vars, out_vars, operation):
-    in_params = ', '.join('%s v%s' % (_dtype_to_ctype[v.ty], v.num)
-                          for v in in_vars)
-    out_params = ''.join('%s v%s;\n' % (_dtype_to_ctype[v.ty], v.num)
-                         for v in out_vars)
+def _get_pre_code(in_refs, out_refs, operation):
+    in_params = ', '.join('%s v%s' % (_dtype_to_ctype[r.ty], r.num)
+                          for r in in_refs)
+    out_params = ''.join('%s v%s;\n' % (_dtype_to_ctype[r.ty], r.num)
+                         for r in out_refs)
     module_code = string.Template('''
     __device__ ${return_type} _pre_map(${in_params}) {
       ${out_params}
@@ -452,11 +478,11 @@ def _get_pre_code(in_vars, out_vars, operation):
       return ${return_var};
     }
     ''').substitute(
-        return_type=_dtype_to_ctype[out_vars[0].ty],
+        return_type=_dtype_to_ctype[out_refs[0].ty],
         in_params=in_params,
         out_params=out_params,
         operation=operation,
-        return_var='v%d' % out_vars[0].num)
+        return_var='v%d' % out_refs[0].num)
     return module_code
 
 
@@ -467,7 +493,8 @@ def _get_reduce_op(ops, dtype):
     raise TypeError("Type is mismatched. %s(...), %s" % (ops.name, dtype.type))
 
 
-def _get_post_code(post_vars, operation, post_out):
+def _get_post_code(mem, operation, post_out):
+    post_vars = mem.var_list
     module_code = string.Template('''
     __device__ ${return_type} _post_map(${arg_type} v0) {
       ${operation};
@@ -496,21 +523,18 @@ def _get_fix_code(data_type, fixed_type, operation):
 
 
 def _get_fusion(func, nin, reduce, post_map, identity, input_types, name=None):
-    in_vars = [_FusionVar(i, t) for i, t in enumerate(input_types)]
-    mem = _FusionMem(in_vars)
-    in_refs = [_FusionRef(_, mem) for _ in in_vars]
+    mem = _FusionMem()
+    in_refs = [_FusionRef.from_type(t, mem) for t in input_types]
     out_refs = func(*in_refs)
     out_refs = list(out_refs) if type(out_refs) == tuple else [out_refs]
-    out_refs = [_ for _ in out_refs if _ is not None]
-    out_refs = [_FusionRef(_normalize_arg(_, mem), mem) for _ in out_refs]
-    out_vars = [_normalize_arg(copy(_), mem) for _ in out_refs]
-    nout = len(out_vars)
+    out_refs = filter(lambda i: i is not None, out_refs)
+    out_refs = [copy(_) for _ in out_refs]
+    nout = len(out_refs)
     op_list = mem.op_list
-    tmpvars = mem.var_list[nin:-nout] if nout > 0 else mem.var_list[nin:]
 
-    in_params = ', '.join(_get_params(in_vars))
-    out_params = ', '.join(_get_params(out_vars))
-    operation = ''.join(_get_declaration_from_var(_) for _ in tmpvars)
+    in_params = ', '.join(_get_params(in_refs))
+    out_params = ', '.join(_get_params(out_refs))
+    operation = ''.join(mem.get_var_declarations((nin, mem.n_vars - nout)))
     operation += ''.join(_get_declaration_from_op(_) for _ in op_list)
     operation += '\n'.join(_get_operation_code(_) for _ in op_list)
 
@@ -519,8 +543,8 @@ def _get_fusion(func, nin, reduce, post_map, identity, input_types, name=None):
 
     if reduce is None:
         if not out_params:
-            in_params = ', '.join(_get_params(in_vars[:-1]))
-            out_params = ', '.join(_get_params([in_vars[-1]]))
+            in_params = ', '.join(_get_params(in_refs[:-1]))
+            out_params = ', '.join(_get_params([in_refs[-1]]))
         submodules = _gather_submodules(op_list)
         submodule_code = ''.join(_get_submodule_code(_)
                                  for _ in submodules.values())
@@ -531,8 +555,8 @@ def _get_fusion(func, nin, reduce, post_map, identity, input_types, name=None):
         if nout != 1:
             raise Exception("Wrong number of number of arguments")
         # pre-map
-        pre_type = out_vars[0].ty
-        pre_code = _get_pre_code(in_vars, out_vars, operation)
+        pre_type = out_refs[0].ty
+        pre_code = _get_pre_code(in_refs, out_refs, operation)
 
         # reduce
         reduce_op = _get_reduce_op(reduce._raw, pre_type)
@@ -543,19 +567,14 @@ def _get_fusion(func, nin, reduce, post_map, identity, input_types, name=None):
         pre_code += "typedef %s type_in0_raw;\n" % _dtype_to_ctype[reduce_type]
 
         # post-map
-        post_in = [_FusionVar(0, reduce_type)]
-        mem = _FusionMem(post_in)
-        post_in_ref = [_FusionRef(_, mem) for _ in post_in]
-        post_out = _normalize_arg(post_map(*post_in_ref), mem)
-        if type(post_out) == tuple:
-            raise Exception("Can't reduce a tuple")
-        post_vars = mem.var_list
+        mem = _FusionMem()
+        post_in_ref = [_FusionRef.from_type(reduce_type, mem)]
+        post_out = _FusionRef.from_arg(post_map(*post_in_ref), mem)
         post_ops = mem.op_list
-        post_code = ''.join(_get_declaration_from_var(_)
-                            for _ in post_vars[1:])
+        post_code = ''.join(mem.get_var_declarations((1, None)))
         post_code += ''.join(_get_declaration_from_op(_) for _ in post_ops)
         post_code += '\n'.join(_get_operation_code(_) for _ in post_ops)
-        post_code = _get_post_code(post_vars, post_code, post_out)
+        post_code = _get_post_code(mem, post_code, post_out)
         post_code += _get_fix_code(post_type, reduce_type, reduce_op[2][2])
 
         submodules = _gather_submodules(op_list + post_ops)
