@@ -234,9 +234,9 @@ def _get_simple_reduction_function(
         options):
     reduce_type = routine[3]
     if reduce_type is None:
-        reduce_type = _get_typename(out_types[0])
+        reduce_type = _get_dtype_name(out_types[0])
 
-    t = (_get_typename(in_arg_dtype), _get_typename(out_arg_dtype))
+    t = (_get_dtype_name(in_arg_dtype), _get_dtype_name(out_arg_dtype))
     type_preamble = 'typedef %s type_in0_raw; typedef %s type_out0_raw;' % t
 
     gen = KernelGenerator(name)
@@ -257,13 +257,13 @@ class simple_reduction_function(object):
         self._preamble = preamble
         self.nin = 1
         self.nout = 1
-        in_params = _get_param_info('T in0', True)
-        out_params = _get_param_info('T out0', False)
+        in_params = _parse_param_infos('T in0', True)
+        out_params = _parse_param_infos('T out0', False)
         self._params = (
             in_params + out_params +
-            _get_param_info(
+            _parse_param_infos(
                 'CIndexer _in_ind, CIndexer _out_ind', False) +
-            _get_param_info('int32 _block_stride', True))
+            _parse_param_infos('int32 _block_stride', True))
         self._input_expr = 'const type_in0_raw in0 = _raw_in0[_in_ind.get()];'
         self._output_expr = 'type_out0_raw &out0 = _raw_out0[_out_ind.get()];'
         self._routine_cache = {}
@@ -286,11 +286,12 @@ class simple_reduction_function(object):
             out_args = [out]
 
         in_types, out_types, routine = _guess_routine(
-            self.name, self._routine_cache, self._ops, in_args, dtype)
+            self.name, self._routine_cache, tuple(self._ops), in_args, dtype)
 
         axis, raxis = _get_axis(axis, a.ndim)
         out_shape = _get_out_shape(a.shape, axis, raxis, keepdims)
-        out_args = _get_out_args(out_args, out_types, out_shape, 'unsafe')
+        out_args = _get_out_args(
+            out_args, out_types, out_shape, None, 'unsafe', False)
         if 0 in out_shape:
             if len(out_args) == 1:
                 return out_args[0]
@@ -311,7 +312,9 @@ class simple_reduction_function(object):
         inout_args = _get_inout_args(
             in_args, out_args, in_indexer, out_indexer, block_stride,
             self._params, True)
-        param_list = ParameterList(self._params, inout_args)
+        param_list = ParameterList(
+            self._params,
+            tuple([RuntimeArgInfo.from_arg(_) for _ in inout_args]))
 
         kern = _get_simple_reduction_function(
             routine, param_list,
@@ -338,7 +341,7 @@ def _get_reduction_kernel(
         post_map_expr, preamble, options):
     arrays = param_list.get_arrays()
     type_preamble = '\n'.join(
-        'typedef %s %s;' % (_get_typename(v), k)
+        'typedef %s %s;' % (_get_dtype_name(v), k)
         for k, v in types)
     input_expr = '\n'.join(
         ['const {0} {1} = _raw_{1}[_j];'.format(p.ctype, p.name)
@@ -389,15 +392,15 @@ class ReductionKernel(object):
                  map_expr, reduce_expr, post_map_expr,
                  identity, name='reduce_kernel', reduce_type=None,
                  reduce_dims=True, preamble='', options=()):
-        self.in_params = _get_param_info(in_params, True)
-        self.out_params = _get_param_info(out_params, False)
+        self.in_params = _parse_param_infos(in_params, True)
+        self.out_params = _parse_param_infos(out_params, False)
         self.nin = len(self.in_params)
         self.nout = len(self.out_params)
         self.nargs = self.nin + self.nout
         self.params = (
             self.in_params + self.out_params +
-            _get_param_info('CIndexer _in_ind, CIndexer _out_ind', False) +
-            _get_param_info('int32 _block_stride', True))
+            _parse_param_infos('CIndexer _in_ind, CIndexer _out_ind', False) +
+            _parse_param_infos('int32 _block_stride', True))
         self.identity = identity
         self.reduce_expr = reduce_expr
         self.map_expr = map_expr
@@ -468,8 +471,8 @@ class ReductionKernel(object):
 
         axis, raxis = _get_axis(axis, len(broad_shape))
         out_shape = _get_out_shape(broad_shape, axis, raxis, keepdims)
-        out_args = _get_out_args_with_params(
-            out_args, out_types, out_shape, self.out_params, False)
+        out_args = _get_out_args(
+            out_args, out_types, out_shape, self.out_params, None, False)
         if 0 in out_shape:
             return out_args[0]
 
@@ -490,7 +493,9 @@ class ReductionKernel(object):
         inout_args = _get_inout_args(
             in_args, out_args, in_indexer, out_indexer, block_stride,
             self.params, self.reduce_dims)
-        param_list = ParameterList(self.params, inout_args)
+        param_list = ParameterList(
+            self.params,
+            tuple([RuntimeArgInfo.from_arg(_) for _ in inout_args]))
 
         kern = _get_reduction_kernel(
             param_list, types,

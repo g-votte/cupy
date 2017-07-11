@@ -7,6 +7,7 @@ from cupy import util
 
 from cupy.cuda cimport device
 from cupy.cuda cimport function
+from cupy.cuda import stream as stream_module
 
 
 cdef class KernelGenerator(object):
@@ -18,12 +19,12 @@ cdef class KernelGenerator(object):
         self._s = six.StringIO()
         self.kernel_name = kernel_name
 
-    cdef get_function(self, options):
+    cpdef get_function(self, options):
         code = self._s.getvalue()
         module = compile_with_cache(code, options)
         return module.get_function(self.kernel_name)
 
-    cdef emit_elementwise_function(
+    cpdef emit_elementwise_function(
             self, str class_name, ParameterList param_list, operation, preamble,
             loop_prep='', after_loop=''):
 
@@ -51,7 +52,7 @@ cdef class KernelGenerator(object):
             loop_prep=loop_prep,
             after_loop=after_loop))
 
-    cdef emit_reduction_function(
+    cpdef emit_reduction_function(
             self, str class_name, ParameterList param_list,
             int block_size, str reduce_type, object identity,
             str pre_map_expr, str reduce_expr, str post_map_expr,
@@ -170,7 +171,7 @@ cdef class KernelGenerator(object):
             output_expr=output_expr,
             preamble=preamble))
 
-    cdef emit_kernel_entry_function(
+    cpdef emit_kernel_entry_function(
             self, ParameterList param_list, str code):
 
         kernel_params_decl = param_list.get_kernel_params_decl()
@@ -287,12 +288,13 @@ for i in six.integer_types:
     _python_type_to_numpy_type[i] = numpy.int64
 
 
-cpdef str _get_typename(dtype):
+cpdef str _get_dtype_name(dtype):
     if dtype is None:
         raise ValueError('dtype is None')
-    if dtype not in _typenames:
-        dtype = numpy.dtype(dtype).type
-    return _typenames[dtype]
+    name = _typenames.get(dtype)
+    if name is None:
+        name = _typenames[numpy.dtype(dtype).type]
+    return name
 
 
 cpdef list _preprocess_args(args):
@@ -418,82 +420,138 @@ cdef class ParameterInfo:
         readonly bint raw
         readonly bint is_const
 
-    def __init__(self, str param, bint is_const):
-        self.name = None
-        self.dtype = None
-        self.ctype = None
-        self.raw = False
+    def __init__(self, str name, object dtype, str ctype, bint raw, bint is_const):
+        self.name = name
+        self.dtype = dtype
+        self.ctype = ctype
+        self.raw = raw
         self.is_const = is_const
+
+    @staticmethod
+    def indexer(str name, bint raw):
+        return ParameterInfo(name, None, None, raw, False)
+
+    @staticmethod
+    def parse(str param, bint is_const):
+        name = None
+        dtype = None
+        ctype = None
+        raw = False
+
         s = tuple([i for i in param.split() if len(i) != 0])
         if len(s) < 2:
             raise Exception('Syntax error: %s' % param)
 
-        t, self.name = s[-2:]
-        if t == 'CIndexer':
-            pass
-        elif len(t) == 1:
-            self.ctype = t
-        else:
-            dtype = numpy.dtype(t)
-            self.dtype = dtype.type
-            if dtype.name != t:
-                raise ValueError('Wrong type %s' % t)
-            self.ctype = _get_typename(self.dtype)
-
         for i in s[:-2]:
             if i == 'raw':
-                self.raw = True
+                raw = True
             else:
                 raise Exception('Unknown keyword "%s"' % i)
+
+        t, name = s[-2:]
+        if t == 'CIndexer':
+            return ParameterInfo.indexer(name, raw)
+        else:
+            if len(t) == 1:
+                ctype = t
+            else:
+                dtype_ = numpy.dtype(t)
+                dtype = dtype_.type
+                if dtype_.name != t:
+                    raise ValueError('Wrong type %s' % t)
+                ctype = _get_dtype_name(dtype)
+
+            return ParameterInfo(name, dtype, ctype, raw, is_const)
+
+    def __repr__(self):
+        return '<ParameterInfo name={!r} dtype={} ctype={} raw={} is_const={}>'.format(
+            self.name, self.dtype, self.ctype, self.raw, self.is_const)
+
+    cpdef get_var_name(self, RuntimeArgInfo arg_info):
+        if not self.raw and arg_info.typ is ndarray:
+            return '_raw_' + self.name
+        else:
+            return self.name
+
+cdef class RuntimeArgInfo:
+    cdef:
+        readonly object typ
+        readonly object dtype
+        readonly size_t ndim
+
+    def __init__(self, object typ, object dtype, size_t ndim):
+        self.typ = typ
+        self.dtype = dtype
+        self.ndim = ndim
+
+    @staticmethod
+    def from_arg(arg):
+        typ = type(arg)
+        if typ is Indexer:
+            dtype = None
+            ndim = (<Indexer>arg).ndim
+        else:
+            dtype = arg.dtype.type
+            ndim = arg.ndim
+        return RuntimeArgInfo(typ, dtype, ndim)
+
+    def __hash__(self):
+        return hash(self.typ) ^ hash(self.dtype) ^ hash(self.ndim)
+
+    def __richcmp__(RuntimeArgInfo x, RuntimeArgInfo y, int op):
+        if op == 2:
+            return x.typ == y.typ and x.dtype == y.dtype and x.ndim == y.ndim
+        raise NotImplementedError()
+
+    cpdef str get_base_type_expr(self):
+        if self.typ is Indexer:
+            t = 'CIndexer<%d>' % self.ndim
+        else:
+            dt = self.get_dtype_name()
+            if self.typ is ndarray:
+                t = 'CArray<%s, %d>' % (dt, self.ndim)
+            else:
+                t = dt
+        return t
+
+    cpdef str get_dtype_name(self):
+        return _get_dtype_name(self.dtype)
 
 
 cdef class ParameterList:
     cdef:
-        readonly tuple params
-        readonly tuple infos
+        readonly tuple params  # () of ParameterInfo
+        readonly tuple arg_infos  # () of RuntimeArgInfo
         readonly tuple _var_names
         readonly tuple _base_types
 
-    def __init__(self, tuple params, list args):
-        assert len(params) == len(args)
+    def __init__(self, tuple params, tuple arg_infos):
+        assert len(params) == len(arg_infos), (len(params), len(arg_infos))
+        assert all(isinstance(_, ParameterInfo) for _ in params)
+        assert all(isinstance(_, RuntimeArgInfo) for _ in arg_infos)
         self.params = params
-        self.infos = self._get_infos(args)
+        self.arg_infos = arg_infos
 
         self._var_names = None
         self._base_types = None
 
     def __hash__(self):
-        return hash(self.params) ^ hash(self.infos)
+        return hash(self.params) ^ hash(self.arg_infos)
 
     def __richcmp__(ParameterList x, ParameterList y, int op):
         if op == 2:
             return (x.params == y.params and
-                    x.infos == y.infos)
+                    x.arg_infos == y.arg_infos)
         raise NotImplementedError()
-
-    cdef tuple _get_infos(self, list args):
-        ret = []
-        for a in args:
-            t = type(a)
-            if t is Indexer:
-                dtype = None
-            else:
-                dtype = a.dtype.type
-            ret.append((t, dtype, a.ndim))
-        return tuple(ret)
 
     cdef tuple _ensure_var_names(self):
         cdef ParameterInfo p
-        cdef tuple a
+        cdef RuntimeArgInfo a
         if self._var_names is not None:
             return
         ret = []
-        for p, a in zip(self.params, self.infos):
-            is_array = a[0] is ndarray
-            if is_array and not p.raw:
-                ret.append('_raw_' + p.name)
-            else:
-                ret.append(p.name)
+        for p, a in zip(self.params, self.arg_infos):
+            ret.append(p.get_var_name(a))
         self._var_names = tuple(ret)
 
     cdef tuple _ensure_base_types(self):
@@ -501,24 +559,16 @@ cdef class ParameterList:
             return
         ret = []
         for i in range(len(self.params)):
-            p = <ParameterInfo>(self.params[i])
-            type, dtype, ndim = <tuple>(self.infos[i])
-            is_array = type is ndarray
-            if type is Indexer:
-                t = 'CIndexer<%d>' % ndim
-            else:
-                t = _get_typename(dtype)
-                if is_array:
-                    t = 'CArray<%s, %d>' % (t, ndim)
-            ret.append(t)
+            arg_info = <RuntimeArgInfo>self.arg_infos[i]
+            ret.append(arg_info.get_base_type_expr())
         self._base_types = tuple(ret)
 
     cdef list get_arrays(self):
         cdef ParameterInfo p
-        cdef tuple a
+        cdef RuntimeArgInfo a
 
-        return [p for p, a in zip(self.params, self.infos)
-                if not p.raw and a[0] is ndarray]
+        return [p for p, a in zip(self.params, self.arg_infos)
+                if not p.raw and a.typ is ndarray]
 
     cdef str get_kernel_params_decl(self):
         self._ensure_var_names()
@@ -540,33 +590,33 @@ cdef class ParameterList:
             ret.append('%s %s' % (base_type, var_name))
         return ', '.join(ret)
 
-    cdef str get_entry_function_param_list(self):
+    cpdef str get_entry_function_param_list(self):
         self._ensure_var_names()
         return ', '.join(self._var_names)
 
     cdef list generate_ref_variable_decl_init_stmts(self):
         cdef ParameterInfo p
-        cdef tuple a
+        cdef RuntimeArgInfo a
         stmts = []
-        for p, a in zip(self.params, self.infos):
-            if not p.raw and a[0] is ndarray:
-                if p.is_const:
-                    fmt = '{t} &{n} = _raw_{n}[_ind.get()];'
-                else:
-                    fmt = '{t} &{n} = _raw_{n}[_ind.get()];'
-                stmts.append(fmt.format(t=p.ctype, n=p.name))
+        for p, a in zip(self.params, self.arg_infos):
+            if not p.raw and a.typ is ndarray:
+                stmts.append(
+                    '{t} &{n} = _raw_{n}[_ind.get()];'.format(
+                        t=p.ctype, n=p.name))
         return stmts
 
 
 @util.memoize()
-def _get_param_info(s, is_const):
+def _parse_param_infos(str s, bint is_const):
+    """Returns a tuple of ParameterInfo's specified by a string."""
+
     if len(s) == 0:
         return ()
-    return tuple([ParameterInfo(i, is_const) for i in s.strip().split(',')])
+    return tuple([ParameterInfo.parse(_, is_const) for _ in s.strip().split(',')])
 
 
 @util.memoize()
-def _decide_param_types(in_params, out_params, in_arg_dtypes, out_arg_dtypes):
+def _decide_param_types(tuple in_params, tuple out_params, tuple in_arg_dtypes, tuple out_arg_dtypes):
     """Determines the dtypes of input/output arguments in the generated kernel.
 
     Args:
@@ -632,24 +682,27 @@ cdef tuple _broadcast(list args, tuple params, int size):
     cpdef ParameterInfo p
     cpdef bint has_non_none
     cpdef bint use_size = size >= 0
-    values = []
-    has_non_none = False
-    for i in range(len(args)):
-        p = params[i]
-        a = args[i]
-        if not p.raw and isinstance(a, ndarray):
-            has_non_none = True
-            values.append(a)
-        else:
-            values.append(None)
-
-    if use_size:
-        if has_non_none:
-            raise ValueError("Specified 'size' can be used only "
-                             "if all of the ndarray are 'raw'.")
+    if params is None:
+        values = args
     else:
-        if not has_non_none:
-            raise ValueError('Loop size is Undecided')
+        values = []
+        has_non_none = False
+        for i in range(len(args)):
+            p = params[i]
+            a = args[i]
+            if not p.raw and isinstance(a, ndarray):
+                has_non_none = True
+                values.append(a)
+            else:
+                values.append(None)
+
+        if use_size:
+            if has_non_none:
+                raise ValueError("Specified 'size' can be used only "
+                                 "if all of the ndarray are 'raw'.")
+        else:
+            if not has_non_none:
+                raise ValueError('Loop size is Undecided')
 
     brod = broadcast(*values)
     values = list(brod.values)
@@ -664,72 +717,237 @@ cdef tuple _broadcast(list args, tuple params, int size):
     return values, shape
 
 
-cdef list _get_out_args(list out_args, tuple out_types, tuple out_shape,
-                        str casting):
-    if not out_args:
-        return [ndarray(out_shape, t) for t in out_types]
-
-    for i, a in enumerate(out_args):
-        if not isinstance(a, ndarray):
-            raise TypeError(
-                'Output arguments type must be cupy.ndarray')
-        if a.shape != out_shape:
-            raise ValueError('Out shape is mismatched')
-        out_type = out_types[i]
-        if not numpy.can_cast(out_type, a.dtype, casting=casting):
-            msg = 'output (typecode \'{}\') could not be coerced to ' \
-                  'provided output parameter (typecode \'{}\') according to ' \
-                  'the casting rule "{}"'.format(
-                      numpy.dtype(out_type).char,
-                      a.dtype.char,
-                      casting)
-            raise TypeError(msg)
-    return out_args
-
-
-cdef list _get_out_args_with_params(
+cdef list _get_out_args(
         list out_args, tuple out_types, tuple out_shape, tuple out_params,
-        bint use_size):
+        str casting, bint use_size):
     """Allocates output arguments as needed."""
     cdef ParameterInfo p
 
     # There were no out args: allocate them.
     if len(out_args) == 0:
         # Check: if there is a raw parameter, size must be specified.
-        for p in out_params:
-            if p.raw and not use_size:
+        if out_params is not None and not use_size:
+            if any(p.raw for p in out_params):
                 raise ValueError('Output array size is Undecided')
         return [ndarray(out_shape, t) for t in out_types]
 
     # There were out args: check dtype and shape consistency
-    for a, p in zip(out_args, out_params):
+    for a, p, t in zip(out_args, out_params, out_types):
         if not isinstance(a, ndarray):
             raise TypeError(
                 'Output arguments type must be cupy.ndarray')
         if not p.raw and a.shape != out_shape:
             raise ValueError('Out shape is mismatched')
 
+        if casting and not numpy.can_cast(t, a.dtype, casting=casting):
+            msg = 'output (typecode \'{}\') could not be coerced to ' \
+                  'provided output parameter (typecode \'{}\') according to ' \
+                  'the casting rule "{}"'.format(
+                      numpy.dtype(t).char,
+                      a.dtype.char,
+                      casting)
+            raise TypeError(msg)
+
     return out_args
 
 
-@util.memoize(for_each_device=True)
-def _get_elementwise_kernel(ParameterList param_list, types, operation, name,
-                            preamble, kwargs):
-    types_preamble = '\n'.join(
-        'typedef %s %s;' % (_get_typename(v), k) for k, v in types)
-    preamble = types_preamble + '\n' + preamble
+cdef class _BaseElementwiseKernelCallContext:
+    cdef:
+        readonly _BaseElementwiseKernel elementwise
+        readonly object args
+        readonly int size
+        readonly object stream
+        readonly str casting
 
-    op = []
-    for stmt in param_list.generate_ref_variable_decl_init_stmts():
-        op.append(stmt)
-    op.append(operation)
-    operation = '\n'.join(op)
-    gen = KernelGenerator(name)
-    return gen.get_simple_elementwise_kernel(
-        param_list, operation, preamble, **dict(kwargs))
+    def __init__(self, _BaseElementwiseKernel elementwise, tuple args,
+                 int size, stream, str casting):
+
+        assert stream is None or isinstance(stream, stream_module.Stream), \
+            type(stream)
+        self.elementwise = elementwise
+        self.args = args
+        self.size = size
+        self.stream = stream
+        self.casting = casting
+
+    cpdef call(self):
+
+        size = self.size
+        casting = self.casting
+        elementwise = self.elementwise
+        nin = elementwise.nin
+        nout = elementwise.nout
+        reduce_dims = elementwise.reduce_dims
+        out_params = elementwise.out_params
+        inout_params = elementwise.inout_params
+        params = elementwise.params
+        name = elementwise.name
+
+        # Preprocess
+        args = _preprocess_args(self.args)
+
+        # Broadcast
+        args, shape = _broadcast(args, inout_params, size)
+
+        # Decide parameter dtypes.
+        in_types, out_types = self.decide_param_types(args[:nin], args[nin:])
+
+        in_args = [a if isinstance(a, ndarray) else t(a) for a, t in zip(args[:nin], in_types)]
+        out_args = [a if isinstance(a, ndarray) else t(a) for a, t in zip(args[nin:], out_types)]
+
+        # Allocate output args as needed.
+        out_args = _get_out_args(
+            out_args, out_types, shape, out_params, casting, size >= 0)
+        if nout == 1:
+            ret = out_args[0]
+        else:
+            ret = tuple(out_args)
+
+        # If the shape is 0-sized, return immediately without any computation
+        if 0 in shape:
+            return ret
+
+        inout_args = in_args + out_args
+
+        # Reduce array dimensions
+        if reduce_dims:
+            inout_args, shape = _reduce_dims(inout_args, inout_params, shape)
+
+        # Append indexer
+        indexer = Indexer(shape)
+        inout_args.append(indexer)
+
+        inout_arg_infos = tuple([RuntimeArgInfo.from_arg(_)
+                                 for _ in inout_args])
+
+        key = inout_arg_infos
+        kern = elementwise.kernel_cache.get(key)
+        if kern is None:
+
+            param_list = ParameterList(params, inout_arg_infos)
+
+            # Retrieve source
+            operation, preamble = self.get_code(param_list)
+
+            # Launch kernel
+            kern = _get_simple_elementwise_kernel(
+                name, param_list, operation, preamble, None)
+
+            elementwise.kernel_cache[key] = kern
+
+        kern.linear_launch(indexer.size, inout_args, stream=self.stream)
+        return ret
+
+    cpdef decide_param_types(self, list in_args, list out_args):
+        raise NotImplementedError()
+
+    cpdef get_code(self, ParameterList param_list):
+        raise NotImplementedError()
 
 
-cdef class ElementwiseKernel:
+cdef class _ElementwiseKernelCallContext(_BaseElementwiseKernelCallContext):
+
+    cdef:
+         tuple _types
+
+    def __init__(self, _BaseElementwiseKernel elementwise, tuple args, int size, stream):
+        super(_ElementwiseKernelCallContext, self).__init__(
+            elementwise, args, size, stream, None)
+
+    cpdef decide_param_types(self, list in_args, list out_args):
+        in_ndarray_types = tuple(
+            [a.dtype.type if isinstance(a, ndarray) else None
+             for a in in_args])
+        out_ndarray_types = tuple([a.dtype.type for a in out_args])
+
+        in_types, out_types, types = _decide_param_types(
+            self.elementwise.in_params, self.elementwise.out_params,
+            in_ndarray_types, out_ndarray_types)
+
+        # Store types for succeeding get_code()
+        self._types = types
+
+        return in_types, out_types
+
+    cpdef get_code(self, ParameterList param_list):
+        types = self._types
+        operation_ = self.elementwise.operation
+        preamble_ = self.elementwise.preamble
+
+        types_preamble = '\n'.join([
+            'typedef %s %s;' % (_get_dtype_name(v), k) for k, v in types])
+        preamble = types_preamble + '\n' + preamble_
+
+        op = []
+        for stmt in param_list.generate_ref_variable_decl_init_stmts():
+            op.append(stmt)
+        op.append(operation_)
+        operation = '\n'.join(op)
+        return operation, preamble
+
+
+cdef class _BaseElementwiseKernel:
+    cdef:
+        readonly tuple in_params
+        readonly tuple out_params
+        readonly tuple inout_params
+        readonly int nin
+        readonly int nout
+        readonly int nargs
+        readonly tuple params
+        readonly str name
+        readonly bint reduce_dims
+        readonly dict kernel_cache
+
+    def __init__(self, in_params, out_params, name, reduce_dims):
+        if any([p.name == 'i' for p in in_params + out_params]):
+            raise ValueError("Can not use 'i' as a parameter name")
+        self.in_params = in_params
+        self.out_params = out_params
+        self.nin = len(in_params)
+        self.nout = len(out_params)
+        self.nargs = self.nin + self.nout
+        self.inout_params = in_params + out_params
+        self.params = self.inout_params + (ParameterInfo.parse('CIndexer _ind', False),)
+        self.name = name
+        self.reduce_dims = reduce_dims
+        self.kernel_cache = {}
+
+    cpdef call(self, args, kwargs):
+        """Compiles and invokes the elementwise kernel.
+
+        The compilation runs only if the kernel is not cached. Note that the
+        kernels with different argument dtypes or dimensions are not
+        compatible. It means that single ElementwiseKernel object may be
+        compiled into multiple kernel binaries.
+
+        Args:
+            args: Arguments of the kernel.
+            size (int): The size of index range. If specified, ``_ind.size()``
+                in the kernel code will evaluate to this value. Otherwise,
+                it's determined by the result of broadcast.
+
+        Returns:
+            Arrays are returned according to the ``out_params`` argument of the
+            ``__init__`` method.
+
+        """
+
+        size = kwargs.pop('size', None)
+        stream = kwargs.pop('stream', None)
+
+        if size is None:
+            size = -1
+
+        call_ctx = self.create_call_context(args, size, stream, kwargs)
+
+        return call_ctx.call()
+
+    cpdef create_call_context(self, args, int size, stream, kwargs):
+        raise NotImplementedError()
+
+
+cdef class ElementwiseKernel(_BaseElementwiseKernel):
 
     """User-defined elementwise kernel.
 
@@ -766,35 +984,16 @@ cdef class ElementwiseKernel:
     """
 
     cdef:
-        readonly tuple in_params
-        readonly tuple out_params
-        readonly Py_ssize_t nin
-        readonly Py_ssize_t nout
-        readonly Py_ssize_t nargs
-        readonly tuple params
         readonly str operation
-        readonly str name
-        readonly bint reduce_dims
         readonly str preamble
-        readonly object kwargs
 
     def __init__(self, in_params, out_params, operation,
-                 name='kernel', reduce_dims=True, preamble='', **kwargs):
-        self.in_params = _get_param_info(in_params, True)
-        self.out_params = _get_param_info(out_params, False)
-        self.nin = len(self.in_params)
-        self.nout = len(self.out_params)
-        self.nargs = self.nin + self.nout
-        param_rest = _get_param_info('CIndexer _ind', False)
-        self.params = self.in_params + self.out_params + param_rest
+                 name='kernel', reduce_dims=True, preamble=''):
+        in_params = _parse_param_infos(in_params, True)
+        out_params = _parse_param_infos(out_params, False)
+        super(ElementwiseKernel, self).__init__(in_params, out_params, name, reduce_dims)
         self.operation = operation
-        self.name = name
-        self.reduce_dims = reduce_dims
         self.preamble = preamble
-        self.kwargs = frozenset(kwargs.items())
-        names = [p.name for p in self.in_params + self.out_params]
-        if 'i' in names:
-            raise ValueError("Can not use 'i' as a parameter name")
 
     def __call__(self, *args, **kwargs):
         """Compiles and invokes the elementwise kernel.
@@ -806,9 +1005,9 @@ cdef class ElementwiseKernel:
 
         Args:
             args: Arguments of the kernel.
-            size (int): The size of index range. If specified, ``_ind.size()``
-                in the kernel code will evaluate to this value. Otherwise,
-                it's determined by the result of broadcast.
+            size (int): Range size of the indices. If specified, the variable
+                ``n`` is set to this value. Otherwise, the result of
+                broadcasting is used to determine the value of ``n``.
 
         Returns:
             Arrays are returned according to the ``out_params`` argument of the
@@ -816,100 +1015,134 @@ cdef class ElementwiseKernel:
 
         """
 
-        cdef function.Function kern
+        return self.call(args, kwargs)
 
-        size = kwargs.pop('size', None)
-        stream = kwargs.pop('stream', None)
+    cpdef create_call_context(self, args, int size, stream, kwargs):
+        if kwargs:
+            raise TypeError('Wrong arguments %s' % kwargs)
+        return _ElementwiseKernelCallContext(
+            self, args, size, stream)
+
+
+cdef class _UfuncKernelCallContext(_BaseElementwiseKernelCallContext):
+
+    cdef:
+        readonly object dtype
+        readonly tuple ops
+        readonly str _preamble
+
+        str _routine
+        tuple _in_types
+        tuple _out_types
+
+
+    def __init__(self, _BaseElementwiseKernel elementwise, tuple args,
+                 int size, stream, tuple ops, dtype, str casting,
+                 str preamble):
+
+        super(_UfuncKernelCallContext, self).__init__(
+            elementwise, args, size, stream, casting)
+
+        self.dtype = dtype
+        self.ops = ops
+        self._preamble = preamble
+        self._routine = None
+
+    cpdef decide_param_types(self, list in_args, list out_args):
+        in_types, out_types, routine = _guess_routine(
+            self.elementwise.name,
+            (<_UfuncKernel>self.elementwise)._routine_cache,
+            self.ops, in_args, self.dtype)
+
+        # Store variables for succeeding get_code()
+        self._routine = routine
+        self._in_types = in_types
+        self._out_types = out_types
+
+        return in_types, out_types
+
+    cpdef get_code(self, ParameterList param_list):
+        routine_ = self._routine
+        preamble_ = self._preamble
+        in_types = self._in_types
+        out_types = self._out_types
+
+        types = []
+        op = []
+        for i, x in enumerate(in_types):
+            types.append('typedef %s in%d_type;' % (_get_dtype_name(x), i))
+            if param_list.arg_infos[i].typ is ndarray:
+                op.append(
+                    'const in{0}_type in{0} = _raw_in{0}[_ind.get()];'.format(i))
+
+        for i, x in enumerate(out_types):
+            types.append('typedef %s out%d_type;' % (_get_dtype_name(x), i))
+            op.append('{1} &out{0} = _raw_out{0}[_ind.get()];'.format(
+                i, param_list.arg_infos[i + len(in_types)].get_dtype_name()))
+
+        op.append(routine_)
+        operation = '\n'.join(op)
+
+        types.append(preamble_)
+        preamble = '\n'.join(types)
+
+        return operation, preamble
+
+
+cdef class _UfuncKernel(_BaseElementwiseKernel):
+
+    cdef:
+        tuple _ops
+        str _preamble
+        dict _routine_cache
+
+    def __init__(self, nin, nout, name, ops, preamble):
+        self.nin = nin
+        self.nout = nout
+        self.nargs = nin + nout
+        self._ops = ops
+        self._preamble = preamble
+        in_params = tuple(
+            ParameterInfo.parse('T in%d' % i, True)
+            for i in range(nin))
+        out_params = tuple(
+            ParameterInfo.parse('T out%d' % i, False)
+            for i in range(nout))
+        self.params = in_params + out_params + \
+                      (ParameterInfo.parse('CIndexer _ind', False),)
+        self._routine_cache = {}
+
+        super(_UfuncKernel, self).__init__(in_params, out_params, name, False)
+
+
+    cpdef create_call_context(self, args, int size, stream, kwargs):
+        out = kwargs.pop('out', None)
+        dtype = kwargs.pop('dtype', None)
+        # Note default behavior of casting is 'same_kind' on numpy>=1.10
+        casting = kwargs.pop('casting', 'same_kind')
+        if dtype is not None:
+            dtype = numpy.dtype(dtype).type
         if kwargs:
             raise TypeError('Wrong arguments %s' % kwargs)
 
-        n_args = len(args)
-        if n_args != self.nin and n_args != self.nargs:
+        nargs = len(args)
+        if nargs != self.nin and nargs != self.nargs:
             raise TypeError('Wrong number of arguments for %s' % self.name)
 
-        if size is None:
-            size = -1
+        if out is not None:
+            if self.nout != 1:
+                raise ValueError("Cannot use 'out' in %s" % self.name)
+            if nargs != self.nin:
+                raise ValueError("Cannot specify 'out' as both "
+                                 "a positional and keyword argument")
+            args += (out,)
 
-        # Preprocess
-        args = _preprocess_args(args)
-
-        # Broadcast
-        args, shape = _broadcast(args, self.params, size)
-        in_args = args[:self.nin]
-        out_args = args[self.nin:]
-
-        # Decide parameter dtypes.
-        in_ndarray_types = tuple(
-            [a.dtype.type if isinstance(a, ndarray) else None
-             for a in in_args])
-        out_ndarray_types = tuple([a.dtype.type for a in out_args])
-
-        in_types, out_types, types = _decide_param_types(
-            self.in_params, self.out_params,
-            in_ndarray_types, out_ndarray_types)
-
-        # Allocate output args as needed.
-        out_args = _get_out_args_with_params(
-            out_args, out_types, shape, self.out_params, size is not None)
-        if self.nout == 1:
-            ret = out_args[0]
-        else:
-            ret = tuple(out_args)
-
-        # If the shape is 0-sized, return immediately without any computation
-        if 0 in shape:
-            return ret
-
-        inout_args = in_args + out_args
-
-        # Reduce array dimensions
-        if self.reduce_dims:
-            inout_args, shape = _reduce_dims(inout_args, self.params, shape)
-
-        # Append indexer
-        indexer = Indexer(shape)
-        inout_args.append(indexer)
-
-        # Compile and launch the kernel
-        param_list = ParameterList(self.params, inout_args)
-        kern = _get_elementwise_kernel(
-            param_list, types, self.operation,
-            self.name, self.preamble, self.kwargs)
-        kern.linear_launch(indexer.size, inout_args, shared_mem=0,
-                           block_max_size=128, stream=stream)
-        return ret
+        return _UfuncKernelCallContext(
+            self, args, size, stream, self._ops, dtype, casting,
+            self._preamble)
 
 
-@util.memoize(for_each_device=True)
-def _get_ufunc_kernel(
-        in_types, out_types, routine, ParameterList param_list, name,
-        preamble):
-
-    types = []
-    op = []
-    for i, x in enumerate(in_types):
-        types.append('typedef %s in%d_type;' % (_get_typename(x), i))
-        if param_list.infos[i][0] is ndarray:
-            op.append(
-                'const in{0}_type in{0} = _raw_in{0}[_ind.get()];'.format(i))
-
-    for i, x in enumerate(out_types):
-        types.append('typedef %s out%d_type;' % (_get_typename(x), i))
-        op.append('{1} &out{0} = _raw_out{0}[_ind.get()];'.format(
-            i, _get_typename(param_list.infos[i + len(in_types)][1])))
-
-    op.append(routine)
-    operation = '\n'.join(op)
-
-    types.append(preamble)
-    preamble = '\n'.join(types)
-
-    gen = KernelGenerator(name)
-    return gen.get_simple_elementwise_kernel(
-        param_list, operation, preamble)
-
-
-cdef tuple _guess_routine_from_in_types(list ops, tuple in_types):
+cdef tuple _guess_routine_from_in_types(tuple ops, tuple in_types):
     cdef Py_ssize_t i, n
     cdef tuple op, op_types
     n = len(in_types)
@@ -924,7 +1157,7 @@ cdef tuple _guess_routine_from_in_types(list ops, tuple in_types):
     return None
 
 
-cdef tuple _guess_routine_from_dtype(list ops, object dtype):
+cdef tuple _guess_routine_from_dtype(tuple ops, object dtype):
     cdef tuple op, op_types
     for op in ops:
         op_types = op[1]
@@ -954,7 +1187,7 @@ cdef bint _check_should_use_min_scalar(list in_args) except *:
             max_array_kind >= max_scalar_kind)
 
 
-cdef tuple _guess_routine(str name, dict cache, list ops, list in_args, dtype):
+cdef tuple _guess_routine(str name, dict cache, tuple ops, list in_args, dtype):
     """Find the best-matching operation from given dtype or input arguments.
 
     Args:
@@ -997,6 +1230,17 @@ cdef tuple _guess_routine(str name, dict cache, list ops, list in_args, dtype):
     raise TypeError('Wrong type of arguments for %s' % name)
 
 
+@util.memoize(for_each_device=True)
+def _get_simple_elementwise_kernel(
+        str name, ParameterList param_list, str operation, str preamble,
+        frozenset kwargs):
+
+    gen = KernelGenerator(name)
+    kern = gen.get_simple_elementwise_kernel(
+        param_list, operation, preamble, **dict(kwargs or {}))
+    return kern
+
+
 class ufunc(object):
 
     """Universal function.
@@ -1024,17 +1268,9 @@ class ufunc(object):
         self.nout = nout
         self.nargs = nin + nout
         self._ops = ops
-        self._preamble = preamble
+        assert len(preamble) == 0, preamble
         self.__doc__ = doc
-        _in_params = tuple(
-            ParameterInfo('T in%d' % i, True)
-            for i in range(nin))
-        _out_params = tuple(
-            ParameterInfo('T out%d' % i, False)
-            for i in range(nout))
-        self._params = _in_params + _out_params + (
-            ParameterInfo('CIndexer _ind', False),)
-        self._routine_cache = {}
+        self.k = _UfuncKernel(nin, nout, name, tuple(ops), preamble)
 
     def __repr__(self):
         return "<ufunc '%s'>" % self.name
@@ -1070,67 +1306,7 @@ class ufunc(object):
 
         """
 
-        cdef function.Function kern
-
-        out = kwargs.pop('out', None)
-        dtype = kwargs.pop('dtype', None)
-        # Note default behavior of casting is 'same_kind' on numpy>=1.10
-        casting = kwargs.pop('casting', 'same_kind')
-        if dtype is not None:
-            dtype = numpy.dtype(dtype).type
-        if kwargs:
-            raise TypeError('Wrong arguments %s' % kwargs)
-
-        n_args = len(args)
-        if n_args != self.nin and n_args != self.nargs:
-            raise TypeError('Wrong number of arguments for %s' % self.name)
-
-        args = _preprocess_args(args)
-        if out is None:
-            in_args = args[:self.nin]
-            out_args = args[self.nin:]
-        else:
-            if self.nout != 1:
-                raise ValueError("Cannot use 'out' in %s" % self.name)
-            if n_args != self.nin:
-                raise ValueError("Cannot specify 'out' as both "
-                                 "a positional and keyword argument")
-
-            in_args = list(args)
-            out_args = _preprocess_args((out,))
-            args += out_args
-
-        broad = broadcast(*args)
-        shape = broad.shape
-
-        in_types, out_types, routine = _guess_routine(
-            self.name, self._routine_cache, self._ops, in_args, dtype)
-
-        out_args = _get_out_args(out_args, out_types, shape, casting)
-        if self.nout == 1:
-            ret = out_args[0]
-        else:
-            ret = tuple(out_args)
-
-        if 0 in shape:
-            return ret
-
-        inout_args = []
-        for i, t in enumerate(in_types):
-            x = broad.values[i]
-            inout_args.append(x if isinstance(x, ndarray) else t(x))
-        inout_args.extend(out_args)
-        inout_args, shape = _reduce_dims(inout_args, self._params, shape)
-        indexer = Indexer(shape)
-        inout_args.append(indexer)
-        param_list = ParameterList(self._params, inout_args)
-
-        kern = _get_ufunc_kernel(
-            in_types, out_types, routine, param_list,
-            self.name, self._preamble)
-
-        kern.linear_launch(indexer.size, inout_args)
-        return ret
+        return self.k.call(args, kwargs)
 
 
 cpdef create_ufunc(name, ops, routine=None, preamble='', doc=''):
@@ -1150,11 +1326,15 @@ cpdef create_ufunc(name, ops, routine=None, preamble='', doc=''):
     """
     _ops = []
     for t in ops:
-        if not isinstance(t, tuple):
+        if isinstance(t, str):
             typ = t
             rt = routine
-        else:
+        elif isinstance(t, tuple):
             typ, rt = t
+            assert isinstance(typ, str)
+            assert isinstance(rt, str)
+        else:
+            assert False
 
         types = typ.split('->')
         if len(types) == 1:

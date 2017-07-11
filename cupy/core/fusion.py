@@ -693,11 +693,7 @@ class ufunc(core.ufunc):
         self.nin = fusion_op.nin
         self.nout = fusion_op.nout
         self.nargs = fusion_op.nargs
-        self._ops = fusion_op._ops
-        self._preamble = fusion_op._preamble
         self.__doc__ = fusion_op.__doc__
-        self._params = fusion_op._params
-        self._routine_cache = fusion_op._routine_cache
 
         self._fusion_op = fusion_op
         self._cupy_op = cupy_op

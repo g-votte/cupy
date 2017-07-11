@@ -3758,7 +3758,7 @@ def _inclusive_scan_kernel(dtype, block_size):
     """
 
     name = "inclusive_scan_kernel"
-    dtype = _get_typename(dtype)
+    dtype = _get_dtype_name(dtype)
     source = string.Template("""
     extern "C" __global__ void ${name}(const CArray<${dtype}, 1> src,
         CArray<${dtype}, 1> dst){
@@ -3805,7 +3805,7 @@ def _inclusive_scan_kernel(dtype, block_size):
 @util.memoize(for_each_device=True)
 def _add_scan_blocked_sum_kernel(dtype):
     name = "add_scan_blocked_sum_kernel"
-    dtype = _get_typename(dtype)
+    dtype = _get_dtype_name(dtype)
     source = string.Template("""
     extern "C" __global__ void ${name}(CArray<${dtype}, 1> src_dst){
         long long n = src_dst.size();
@@ -3825,8 +3825,8 @@ def _add_scan_blocked_sum_kernel(dtype):
 @util.memoize(for_each_device=True)
 def _nonzero_1d_kernel(src_dtype, index_dtype):
     name = "nonzero_1d_kernel"
-    src_dtype = _get_typename(src_dtype)
-    index_dtype = _get_typename(index_dtype)
+    src_dtype = _get_dtype_name(src_dtype)
+    index_dtype = _get_dtype_name(index_dtype)
 
     source = string.Template("""
     extern "C" __global__ void ${name}(const CArray<${src_dtype}, 1> src,
@@ -3848,9 +3848,9 @@ def _nonzero_1d_kernel(src_dtype, index_dtype):
 @util.memoize(for_each_device=True)
 def _nonzero_kernel(src_dtype, src_ndim, index_dtype, dst_dtype):
     name = "nonzero_kernel"
-    src_dtype = _get_typename(src_dtype)
-    index_dtype = _get_typename(index_dtype)
-    dst_dtype = _get_typename(dst_dtype)
+    src_dtype = _get_dtype_name(src_dtype)
+    index_dtype = _get_dtype_name(index_dtype)
+    dst_dtype = _get_dtype_name(dst_dtype)
 
     source = string.Template("""
         extern "C" __global__ void ${name}(const CArray<${src_dtype}, 1> src,
