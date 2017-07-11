@@ -239,8 +239,9 @@ def _get_simple_reduction_function(
     t = (_get_typename(in_arg_dtype), _get_typename(out_arg_dtype))
     type_preamble = 'typedef %s type_in0_raw; typedef %s type_out0_raw;' % t
 
-    return _get_simple_reduction_kernel(
-        name, block_size, reduce_type, param_list, identity,
+    gen = KernelGenerator(name)
+    return gen.get_simple_reduction_kernel(
+        param_list, block_size, reduce_type, identity,
         routine[0], routine[1], routine[2],
         type_preamble, input_expr, output_expr, _preamble, options)
 
@@ -346,8 +347,9 @@ def _get_reduction_kernel(
         ['{0} &{1} = _raw_{1}[_i];'.format(p.ctype, p.name)
          for p in arrays if not p.is_const])
 
-    return _get_simple_reduction_kernel(
-        name, block_size, reduce_type, param_list, identity,
+    gen = KernelGenerator(name)
+    return gen.get_simple_reduction_kernel(
+        param_list, block_size, reduce_type, identity,
         map_expr, reduce_expr, post_map_expr,
         type_preamble, input_expr, output_expr, preamble, options)
 

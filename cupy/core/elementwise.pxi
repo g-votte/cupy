@@ -9,66 +9,239 @@ from cupy.cuda cimport device
 from cupy.cuda cimport function
 
 
-cpdef str _generate_elementwise_class_def(
-        str name, ParameterList param_list, operation, preamble,
-        loop_prep='', after_loop=''):
+cdef class KernelGenerator(object):
+    cdef:
+        readonly str kernel_name
+        object _s
 
-    params_decl = param_list.get_elementwise_function_params_decl()
-    module_code = string.Template('''
+    def __init__(self, str kernel_name):
+        self._s = six.StringIO()
+        self.kernel_name = kernel_name
 
-    class ${name} {
-    private:
-      ${preamble}
-    public:
-      __device__ void compute(${params_decl}) {
-        ${loop_prep};
-        CUPY_FOR(i, _ind.size()) {
-          _ind.set(i);
-          ${operation};
+    cdef get_function(self, options):
+        code = self._s.getvalue()
+        module = compile_with_cache(code, options)
+        return module.get_function(self.kernel_name)
+
+    cdef emit_elementwise_function(
+            self, str class_name, ParameterList param_list, operation, preamble,
+            loop_prep='', after_loop=''):
+
+        params_decl = param_list.get_entry_function_params_decl()
+        self._s.write(string.Template('''
+
+        class ${class_name} {
+        private:
+          ${preamble}
+        public:
+          __device__ void compute(${params_decl}) {
+            ${loop_prep};
+            CUPY_FOR(i, _ind.size()) {
+              _ind.set(i);
+              ${operation};
+            }
+            ${after_loop};
+          }
+        };
+        ''').substitute(
+            params_decl=params_decl,
+            operation=operation,
+            class_name=class_name,
+            preamble=preamble,
+            loop_prep=loop_prep,
+            after_loop=after_loop))
+
+    cdef emit_reduction_function(
+            self, str class_name, ParameterList param_list,
+            int block_size, str reduce_type, object identity,
+            str pre_map_expr, str reduce_expr, str post_map_expr,
+            str type_preamble, str input_expr, str output_expr, str preamble):
+
+        if identity is None:
+            identity = ''
+        else:
+            identity = str(identity)
+
+        params_decl = param_list.get_entry_function_params_decl()
+        self._s.write(string.Template('''
+
+        class ${class_name} {
+        private:
+          ${type_preamble}
+          ${preamble}
+
+          typedef ${reduce_type} _type_reduce;
+
+          __device__ _type_reduce REDUCE(const _type_reduce& a,
+                                         const _type_reduce& b) {
+            return (${reduce_expr});
+          }
+
+          __device__ void _REDUCE(_type_reduce* _sdata,
+                                  unsigned int tid,
+                                  unsigned int offset) {
+            if (tid < offset) {
+              _type_reduce _a = _sdata[tid], _b = _sdata[(tid + offset)];
+              _sdata[tid] = REDUCE(_a, _b);
+            }
+          }
+
+        public:
+          __device__ void compute(${params_decl}) {
+            extern __shared__ _type_reduce _sdata_raw[];
+            _type_reduce *_sdata = _sdata_raw;
+            unsigned int _tid = threadIdx.x;
+
+            int _J_offset = _tid / _block_stride;
+            int _j_offset = _J_offset * _out_ind.size();
+            int _J_stride = ${block_size};
+            long long _j_stride = ${block_size}LL * _out_ind.size();
+
+            for (int _i_base = blockIdx.x * _block_stride;
+                 _i_base < _out_ind.size();
+                 _i_base += gridDim.x * _block_stride) {
+              _type_reduce _s = _type_reduce(${identity});
+              int _i = _i_base + _tid % _block_stride;
+              int _J = _J_offset;
+              for (long long _j = _i + _j_offset; _j < _in_ind.size();
+                   _j += _j_stride, _J += _J_stride) {
+                _in_ind.set(_j);
+                ${input_expr}
+                _type_reduce _a = ${pre_map_expr};
+                _s = REDUCE(_s, _a);
+              }
+              if (_block_stride < ${block_size}) {
+                _sdata[_tid] = _s;
+                __syncthreads();
+                if (_block_stride <= 256) {
+                  _REDUCE(_sdata, _tid, 256);
+                  __syncthreads();
+                  if (_block_stride <= 128) {
+                    _REDUCE(_sdata, _tid, 128);
+                    __syncthreads();
+                    if (_block_stride <= 64) {
+                      _REDUCE(_sdata, _tid, 64);
+                      __syncthreads();
+                      if (_block_stride <= 32) {
+                        _REDUCE(_sdata, _tid, 32);
+                        if (_block_stride <= 16) {
+                          _REDUCE(_sdata, _tid, 16);
+                          if (_block_stride <= 8) {
+                            _REDUCE(_sdata, _tid, 8);
+                            if (_block_stride <= 4) {
+                              _REDUCE(_sdata, _tid, 4);
+                              if (_block_stride <= 2) {
+                                _REDUCE(_sdata, _tid, 2);
+                                if (_block_stride <= 1) {
+                                  _REDUCE(_sdata, _tid, 1);
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+                _s = _sdata[_tid];
+                __syncthreads();
+              }
+              if (_J_offset == 0 && _i < _out_ind.size()) {
+                _out_ind.set(_i);
+                ${output_expr};
+                {
+                  _type_reduce a = _s;  // referred in 'post_map_expr'
+                  ${post_map_expr};
+                }
+              }
+            }
+          }
+        };''').substitute(
+            class_name=class_name,
+            params_decl=params_decl,
+            block_size=block_size,
+            reduce_type=reduce_type,
+            identity=identity,
+            reduce_expr=reduce_expr,
+            pre_map_expr=pre_map_expr,
+            post_map_expr=post_map_expr,
+            type_preamble=type_preamble,
+            input_expr=input_expr,
+            output_expr=output_expr,
+            preamble=preamble))
+
+    cdef emit_kernel_entry_function(
+            self, ParameterList param_list, str code):
+
+        kernel_params_decl = param_list.get_kernel_params_decl()
+        self._s.write(string.Template('''
+        // Kernel function
+        extern "C" __global__ void ${kernel_name}(${kernel_params_decl}) {
+          ${code}
         }
-        ${after_loop};
-      }
-    };
-    ''').substitute(
-        params_decl=params_decl,
-        operation=operation,
-        name=name,
-        preamble=preamble,
-        loop_prep=loop_prep,
-        after_loop=after_loop)
-    return module_code
+        ''').substitute(
+            kernel_name=self.kernel_name,
+            kernel_params_decl=kernel_params_decl,
+            code=code))
 
+    cdef emit_simple_elementwise_kernel_entry_function(
+            self, ParameterList param_list, operation, preamble,
+            loop_prep='', after_loop=''):
 
-cpdef _get_simple_elementwise_kernel(
-        ParameterList param_list, operation, str kernel_name, preamble,
-        loop_prep='', after_loop='', options=()):
+        # Emit elementwise function code
+        class_name = self.kernel_name + '__impl'
+        self.emit_elementwise_function(
+            class_name, param_list, operation, preamble, loop_prep, after_loop)
 
-    kernel_params_decl = param_list.get_kernel_params_decl()
-    elementwise_param_list = param_list.get_elementwise_function_param_list()
-    class_name = kernel_name + '__impl'
+        # Emit kernel entry function
+        param_list_expr = param_list.get_entry_function_param_list()
+        code = '{class_name}().compute({param_list_expr});'.format(
+            class_name=class_name,
+            param_list_expr=param_list_expr,
+        )
+        self.emit_kernel_entry_function(param_list, code)
 
-    class_def = _generate_elementwise_class_def(
-        class_name, param_list, operation, preamble, loop_prep, after_loop)
+    cpdef get_simple_elementwise_kernel(
+            self, ParameterList param_list, operation, preamble,
+            loop_prep='', after_loop='', tuple options=()):
 
-    module_code = string.Template('''
-    // Elementwise function class
-    ${class_def}
+        self.emit_simple_elementwise_kernel_entry_function(
+            param_list, operation, preamble, loop_prep, after_loop)
+        return self.get_function(options)
 
-    // Kernel function
-    extern "C" __global__ void ${kernel_name}(${kernel_params_decl}) {
-      ${class_name}().compute(${elementwise_param_list});
-    }
-    ''').substitute(
-        kernel_name=kernel_name,
-        kernel_params_decl=kernel_params_decl,
-        elementwise_param_list=elementwise_param_list,
-        class_name=class_name,
-        class_def=class_def,
-        preamble=preamble,
-        loop_prep=loop_prep,
-        after_loop=after_loop)
-    module = compile_with_cache(module_code, options)
-    return module.get_function(kernel_name)
+    cdef emit_simple_reduction_kernel_entry_function(
+            self, ParameterList param_list,
+            int block_size, str reduce_type, object identity,
+            str pre_map_expr, str reduce_expr, str post_map_expr,
+            str type_preamble, str input_expr, str output_expr, str preamble):
+
+        # Emit reduction function code
+        class_name = self.kernel_name + '__impl'
+        self.emit_reduction_function(
+            class_name, param_list, block_size, reduce_type, identity,
+            pre_map_expr, reduce_expr, post_map_expr, type_preamble,
+            input_expr, output_expr, preamble)
+
+        # Emit kernel entry function
+        param_list_expr = param_list.get_entry_function_param_list()
+        code = '{class_name}().compute({param_list_expr});'.format(
+            class_name=class_name,
+            param_list_expr=param_list_expr,
+        )
+        self.emit_kernel_entry_function(param_list, code)
+
+    cpdef get_simple_reduction_kernel(
+            self, ParameterList param_list,
+            int block_size, str reduce_type, object identity,
+            str pre_map_expr, str reduce_expr, str post_map_expr,
+            str type_preamble, str input_expr, str output_expr, str preamble,
+            tuple options=()):
+
+        self.emit_simple_reduction_kernel_entry_function(
+            param_list, block_size, reduce_type, identity, pre_map_expr,
+            reduce_expr, post_map_expr, type_preamble, input_expr, output_expr,
+            preamble)
+        return self.get_function(options)
 
 
 cdef dict _typenames_base = {
@@ -357,7 +530,7 @@ cdef class ParameterList:
             ret.append('%s %s' % (base_type, var_name))
         return ', '.join(ret)
 
-    cdef str get_elementwise_function_params_decl(self):
+    cdef str get_entry_function_params_decl(self):
         self._ensure_var_names()
         self._ensure_base_types()
         ret = []
@@ -367,21 +540,7 @@ cdef class ParameterList:
             ret.append('%s %s' % (base_type, var_name))
         return ', '.join(ret)
 
-    cdef str get_elementwise_function_param_list(self):
-        self._ensure_var_names()
-        return ', '.join(self._var_names)
-
-    cdef str get_reduction_function_params_decl(self):
-        self._ensure_var_names()
-        self._ensure_base_types()
-        ret = []
-        for i in range(len(self.params)):
-            base_type = <str>(self._base_types[i])
-            var_name = <str>(self._var_names[i])
-            ret.append('%s %s' % (base_type, var_name))
-        return ', '.join(ret)
-
-    cdef str get_reduction_function_param_list(self):
+    cdef str get_entry_function_param_list(self):
         self._ensure_var_names()
         return ', '.join(self._var_names)
 
@@ -565,9 +724,9 @@ def _get_elementwise_kernel(ParameterList param_list, types, operation, name,
         op.append(stmt)
     op.append(operation)
     operation = '\n'.join(op)
-    return _get_simple_elementwise_kernel(
-        param_list, operation, name,
-        preamble, **dict(kwargs))
+    gen = KernelGenerator(name)
+    return gen.get_simple_elementwise_kernel(
+        param_list, operation, preamble, **dict(kwargs))
 
 
 cdef class ElementwiseKernel:
@@ -745,8 +904,9 @@ def _get_ufunc_kernel(
     types.append(preamble)
     preamble = '\n'.join(types)
 
-    return _get_simple_elementwise_kernel(
-        param_list, operation, name, preamble)
+    gen = KernelGenerator(name)
+    return gen.get_simple_elementwise_kernel(
+        param_list, operation, preamble)
 
 
 cdef tuple _guess_routine_from_in_types(list ops, tuple in_types):
