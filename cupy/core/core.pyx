@@ -2166,6 +2166,121 @@ def array_split(ndarray ary, indices_or_sections, Py_ssize_t axis):
     return ret
 
 
+cdef class _broadcast_impl:
+
+    cdef:
+        vector.vector[Py_ssize_t] _shape
+        readonly Py_ssize_t size
+        readonly Py_ssize_t nd
+        readonly list strides_list
+
+    def __init__(self, arg_infos):
+        cdef Py_ssize_t i, j, s, ss, a_ndim, a_sh
+        cdef vector.vector[vector.vector[Py_ssize_t]] shape_arr
+        cdef vector.vector[Py_ssize_t] strides, r_strides, r_shape, a_shape
+        cdef ArgInfo arg
+
+        rev = slice(None, None, -1)
+
+        self.nd = 0
+        for arg in arg_infos:
+            if arg is None:
+
+                continue
+            if not arg.is_ndarray:
+                continue
+            self.nd = max(self.nd, arg.ndim)
+            r_shape = reversed(arg.shape)
+            shape_arr.push_back(r_shape)
+
+        r_shape.clear()
+        for i in range(self.nd):
+            ss = 0
+            for j in range(<Py_ssize_t>shape_arr.size()):
+                if i < <Py_ssize_t>shape_arr[j].size():
+                    s = shape_arr[j][i]
+                    ss = max(ss, s)
+            r_shape.push_back(ss)
+
+        self._shape.assign(r_shape.rbegin(), r_shape.rend())
+        self.size = internal.prod_ssize_t(self._shape)
+
+        # `None` means the original argument can be used without
+        # chainging strides.
+        strides_list = []
+
+        for arg in arg_infos:
+            if arg is None:
+                strides_list.append(None)
+                continue
+            if not arg.is_ndarray:
+                strides_list.append(None)
+                continue
+
+            a_shape = arg.shape
+            if internal.vector_equal(a_shape, self._shape):
+                strides_list.append(None)
+                continue
+
+            r_strides.assign(self.nd, <Py_ssize_t>0)
+            a_ndim = arg.ndim
+            strides_ = arg.strides
+            for i in range(a_ndim):
+                a_sh = a_shape[a_ndim - i - 1]
+                if a_sh == r_shape[i]:
+                    r_strides[i] = strides_[a_ndim - i - 1]
+                elif a_sh != 1:
+                    raise ValueError('Broadcasting failed')
+
+            strides.assign(r_strides.rbegin(), r_strides.rend())
+            strides_list.append(strides)
+
+        self.strides_list = strides_list
+
+    cpdef tuple shape(self):
+        return tuple(self._shape)
+
+    cpdef list apply(self, arrays):
+        cdef ndarray view
+        cdef vector.vector[Py_ssize_t] strides
+
+        assert len(arrays) == len(self.strides_list), \
+            (len(arrays), len(self.strides_list))
+
+        broadcasted = []
+        for i in range(<Py_ssize_t>len(arrays)):
+            x = arrays[i]
+            strides_ = self.strides_list[i]
+            if strides_ is None:
+                broadcasted.append(x)
+            else:
+                strides = <vector.vector[Py_ssize_t]>strides_
+                view = (<ndarray>x).view()
+                view._set_shape_and_strides(self._shape, strides)
+                broadcasted.append(view)
+
+        return broadcasted
+
+    cpdef list apply_infos(self, arg_infos):
+        cdef ArgInfo a
+
+        assert len(arg_infos) == len(self.strides_list)
+
+        broadcasted = []
+        for i in range(<Py_ssize_t>len(arg_infos)):
+            a = arg_infos[i]
+            strides_ = self.strides_list[i]
+            if strides_ is None:
+                broadcasted.append(a)
+            else:
+                strides = <vector.vector[Py_ssize_t]>strides_
+                shape = tuple(self._shape)
+                broadcasted.append(
+                    ArgInfo(None, ndarray, a.dtype, shape, len(shape), tuple(strides)))
+
+        return broadcasted
+
+
 cdef class broadcast:
     """Object that performs broadcasting.
 
@@ -2192,59 +2307,12 @@ cdef class broadcast:
         readonly Py_ssize_t nd
 
     def __init__(self, *arrays):
-        cdef Py_ssize_t i, j, s, ss, a_ndim, a_sh
-        cdef vector.vector[Py_ssize_t] shape, strides, r_shape, r_strides
-        cdef vector.vector[vector.vector[Py_ssize_t]] shape_arr
-        cdef ndarray a, view
-        rev = slice(None, None, -1)
-
-        self.nd = 0
-        for x in arrays:
-            if not isinstance(x, ndarray):
-                continue
-            a = x
-            self.nd = max(self.nd, <Py_ssize_t>a._shape.size())
-            r_shape.assign(a._shape.rbegin(), a._shape.rend())
-            shape_arr.push_back(r_shape)
-
-        r_shape.clear()
-        for i in range(self.nd):
-            ss = 0
-            for j in range(<Py_ssize_t>shape_arr.size()):
-                if i < <Py_ssize_t>shape_arr[j].size():
-                    s = shape_arr[j][i]
-                    ss = max(ss, s)
-            r_shape.push_back(ss)
-
-        shape.assign(r_shape.rbegin(), r_shape.rend())
-        self.shape = tuple(shape)
-        self.size = internal.prod_ssize_t(shape)
-
-        broadcasted = []
-        for x in arrays:
-            if not isinstance(x, ndarray):
-                broadcasted.append(x)
-                continue
-            a = x
-            if internal.vector_equal(a._shape, shape):
-                broadcasted.append(a)
-                continue
-
-            r_strides.assign(self.nd, <Py_ssize_t>0)
-            a_ndim = a._shape.size()
-            for i in range(a_ndim):
-                a_sh = a._shape[a_ndim - i - 1]
-                if a_sh == r_shape[i]:
-                    r_strides[i] = a._strides[a_ndim - i - 1]
-                elif a_sh != 1:
-                    raise ValueError('Broadcasting failed')
-
-            strides.assign(r_strides.rbegin(), r_strides.rend())
-            view = a.view()
-            view._set_shape_and_strides(shape, strides)
-            broadcasted.append(view)
-
-        self.values = tuple(broadcasted)
+        arg_infos = ArgInfo_from_args(arrays, True)
+        impl = _broadcast_impl(arg_infos)
+        self.values = tuple(impl.apply(arrays))
+        self.shape = tuple(impl.shape())
+        self.size = impl.size
+        self.nd = impl.nd
 
 
 cpdef ndarray broadcast_to(ndarray array, shape):
@@ -3972,7 +4040,7 @@ def _inclusive_scan_kernel(dtype, block_size):
     """
 
     name = "inclusive_scan_kernel"
-    dtype = _get_typename(dtype)
+    dtype = _get_dtype_name(dtype)
     source = string.Template("""
     extern "C" __global__ void ${name}(const CArray<${dtype}, 1> src,
         CArray<${dtype}, 1> dst){
@@ -4019,7 +4087,7 @@ def _inclusive_scan_kernel(dtype, block_size):
 @util.memoize(for_each_device=True)
 def _add_scan_blocked_sum_kernel(dtype):
     name = "add_scan_blocked_sum_kernel"
-    dtype = _get_typename(dtype)
+    dtype = _get_dtype_name(dtype)
     source = string.Template("""
     extern "C" __global__ void ${name}(CArray<${dtype}, 1> src_dst){
         long long n = src_dst.size();
@@ -4039,8 +4107,8 @@ def _add_scan_blocked_sum_kernel(dtype):
 @util.memoize(for_each_device=True)
 def _nonzero_1d_kernel(src_dtype, index_dtype):
     name = "nonzero_1d_kernel"
-    src_dtype = _get_typename(src_dtype)
-    index_dtype = _get_typename(index_dtype)
+    src_dtype = _get_dtype_name(src_dtype)
+    index_dtype = _get_dtype_name(index_dtype)
 
     source = string.Template("""
     extern "C" __global__ void ${name}(const CArray<${src_dtype}, 1> src,
@@ -4062,9 +4130,9 @@ def _nonzero_1d_kernel(src_dtype, index_dtype):
 @util.memoize(for_each_device=True)
 def _nonzero_kernel(src_dtype, src_ndim, index_dtype, dst_dtype):
     name = "nonzero_kernel"
-    src_dtype = _get_typename(src_dtype)
-    index_dtype = _get_typename(index_dtype)
-    dst_dtype = _get_typename(dst_dtype)
+    src_dtype = _get_dtype_name(src_dtype)
+    index_dtype = _get_dtype_name(index_dtype)
+    dst_dtype = _get_dtype_name(dst_dtype)
 
     source = string.Template("""
         extern "C" __global__ void ${name}(const CArray<${src_dtype}, 1> src,

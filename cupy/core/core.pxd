@@ -72,3 +72,25 @@ cdef class Indexer:
         readonly tuple shape
 
     cdef CPointer get_pointer(self)
+
+
+cdef class _BaseKernel(object):
+    cdef:
+        readonly str name
+        readonly int nin
+        readonly int nout
+        readonly int nargs
+        readonly tuple in_params
+        readonly tuple out_params
+        readonly tuple inout_params
+        readonly dict kernel_cache
+
+
+cdef class _BaseReductionKernel(_BaseKernel):
+    cdef:
+        readonly str identity
+        readonly str preamble
+        readonly tuple params
+        readonly bint reduce_dims
+        readonly tuple options
+        readonly int block_size
