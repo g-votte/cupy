@@ -145,25 +145,24 @@ cpdef str _get_kernel_params(tuple params, tuple args_info):
 
 
 cpdef tuple _reduce_dims(list args, tuple params, tuple shape):
+    """Reduce the dimensions of arrays into the minimum without copy."""
     cdef Py_ssize_t i, j, n, ndim, cnt, axis, s
     cdef vector.vector[Py_ssize_t] vecshape, newshape, newstrides
     cdef vector.vector[bint] is_array_flags
     cdef vector.vector[vector.vector[Py_ssize_t]] args_strides
     cdef ParameterInfo p
     cdef ndarray arr, view
-    cdef bint flag
+    cdef bint is_array
 
     ndim = len(shape)
     if ndim <= 1:
         return args, shape
 
     n = len(args)
-    for i in range(n):
-        p = params[i]
-        a = args[i]
-        flag = not p.raw and isinstance(a, ndarray)
-        is_array_flags.push_back(flag)
-        if flag:
+    for p, a in zip(params, args):
+        is_array = not p.raw and isinstance(a, ndarray)
+        is_array_flags.push_back(is_array)
+        if is_array:
             arr = a
             args_strides.push_back(arr._strides)
 
@@ -190,10 +189,9 @@ cpdef tuple _reduce_dims(list args, tuple params, tuple shape):
     if cnt == 1:
         newshape.assign(<Py_ssize_t>1, <Py_ssize_t>vecshape[axis])
         ret = []
-        for i, a in enumerate(args):
-            if is_array_flags[i]:
-                arr = a
-                arr = arr.view()
+        for is_array, a in zip(is_array_flags, args):
+            if is_array:
+                arr = (<ndarray>a).view()
                 newstrides.assign(
                     <Py_ssize_t>1, <Py_ssize_t>arr._strides[axis])
                 arr._set_shape_and_strides(newshape, newstrides, False)
@@ -204,6 +202,7 @@ cpdef tuple _reduce_dims(list args, tuple params, tuple shape):
     for i in range(ndim):
         if vecshape[i] != 1:
             newshape.push_back(vecshape[i])
+
     ret = []
     for i, a in enumerate(args):
         if is_array_flags[i]:
@@ -264,11 +263,25 @@ def _get_param_info(s, is_const):
 
 
 @util.memoize()
-def _decide_params_type(in_params, out_params, in_args_dtype, out_args_dtype):
+def _decide_param_types(in_params, out_params, in_arg_dtypes, out_arg_dtypes):
+    """Determines the dtypes of input/output arguments in the generated kernel.
+
+    Args:
+        in_params: ParameterInfo's of input arguments.
+        out_params: ParameterInfo's of output arguments..
+        in_arg_dtypes: Dtypes of input arguments.
+        out_arg_dtypes: Dtypes of output arguments.
+
+    Returns:
+        A 3-element tuple where the first 2 elements are the tuples of
+        input/output dtypes in the generated kernel corresponding to each
+        input/output argument, and the last element is a tuple containing the
+        unique pairs of (dtype, ctype) in undefined order.
+    """
     type_dict = {}
-    if out_args_dtype:
-        assert len(out_params) == len(out_args_dtype)
-        for p, a in zip(out_params, out_args_dtype):
+    if out_arg_dtypes:
+        assert len(out_params) == len(out_arg_dtypes)
+        for p, a in zip(out_params, out_arg_dtypes):
             if a is None:
                 raise TypeError('Output arguments must be cupy.ndarray')
             if p.dtype is not None:
@@ -284,9 +297,9 @@ def _decide_params_type(in_params, out_params, in_args_dtype, out_args_dtype):
             else:
                 type_dict[p.ctype] = a
 
-    assert len(in_params) == len(in_args_dtype)
+    assert len(in_params) == len(in_arg_dtypes)
     unknown_ctype = []
-    for p, a in zip(in_params, in_args_dtype):
+    for p, a in zip(in_params, in_arg_dtypes):
         if a is None:
             if p.dtype is None:
                 unknown_ctype.append(p.ctype)
@@ -311,38 +324,41 @@ def _decide_params_type(in_params, out_params, in_args_dtype, out_args_dtype):
     return in_types, out_types, tuple(type_dict.items())
 
 
-cdef tuple _broadcast(list args, tuple params, bint use_size):
+cdef tuple _broadcast(list args, tuple params, int size):
     cpdef Py_ssize_t i
     cpdef ParameterInfo p
-    cpdef bint is_none, is_not_none
-    value = []
-    is_none = False
-    is_not_none = False
+    cpdef bint has_non_none
+    cpdef bint use_size = size >= 0
+    values = []
+    has_non_none = False
     for i in range(len(args)):
         p = params[i]
         a = args[i]
         if not p.raw and isinstance(a, ndarray):
-            is_not_none = True
-            value.append(a)
+            has_non_none = True
+            values.append(a)
         else:
-            is_none = True
-            value.append(None)
+            values.append(None)
 
     if use_size:
-        if not is_none:
+        if has_non_none:
             raise ValueError("Specified 'size' can be used only "
                              "if all of the ndarray are 'raw'.")
     else:
-        if not is_not_none:
+        if not has_non_none:
             raise ValueError('Loop size is Undecided')
-    brod = broadcast(*value)
-    value = []
+
+    brod = broadcast(*values)
+    values = list(brod.values)
     for i in range(len(args)):
-        a = brod.values[i]
-        if a is None:
-            a = args[i]
-        value.append(a)
-    return value, brod.shape
+        if values[i] is None:
+            values[i] = args[i]
+
+    if use_size:
+        shape = size,
+    else:
+        shape = brod.shape
+    return values, shape
 
 
 cdef list _get_out_args(list out_args, tuple out_types, tuple out_shape,
@@ -370,22 +386,26 @@ cdef list _get_out_args(list out_args, tuple out_types, tuple out_shape,
 
 cdef list _get_out_args_with_params(
         list out_args, tuple out_types, tuple out_shape, tuple out_params,
-        bint is_size_specified=False):
+        bint use_size):
+    """Allocates output arguments as needed."""
     cdef ParameterInfo p
-    if not out_args:
+
+    # There were no out args: allocate them.
+    if len(out_args) == 0:
+        # Check: if there is a raw parameter, size must be specified.
         for p in out_params:
-            if p.raw and is_size_specified is False:
+            if p.raw and not use_size:
                 raise ValueError('Output array size is Undecided')
         return [ndarray(out_shape, t) for t in out_types]
 
-    for i in range(len(out_params)):
-        a = out_args[i]
-        p = out_params[i]
+    # There were out args: check dtype and shape consistency
+    for a, p in zip(out_args, out_params):
         if not isinstance(a, ndarray):
             raise TypeError(
                 'Output arguments type must be cupy.ndarray')
         if not p.raw and a.shape != out_shape:
             raise ValueError('Out shape is mismatched')
+
     return out_args
 
 
@@ -400,11 +420,8 @@ def _get_elementwise_kernel(args_info, types, params, operation, name,
     op = []
     for p, a in zip(params, args_info):
         if not p.raw and a[0] == ndarray:
-            if p.is_const:
-                fmt = '{t} &{n} = _raw_{n}[_ind.get()];'
-            else:
-                fmt = '{t} &{n} = _raw_{n}[_ind.get()];'
-            op.append(fmt.format(t=p.ctype, n=p.name))
+            op.append(
+                '{t} &{n} = _raw_{n}[_ind.get()];'.format(t=p.ctype, n=p.name))
     op.append(operation)
     operation = '\n'.join(op)
     return _get_simple_elementwise_kernel(
@@ -489,9 +506,9 @@ cdef class ElementwiseKernel:
 
         Args:
             args: Arguments of the kernel.
-            size (int): Range size of the indices. If specified, the variable
-                ``n`` is set to this value. Otherwise, the result of
-                broadcasting is used to determine the value of ``n``.
+            size (int): The size of index range. If specified, ``_ind.size()``
+                in the kernel code will evaluate to this value. Otherwise,
+                it's determined by the result of broadcast.
 
         Returns:
             Arrays are returned according to the ``out_params`` argument of the
@@ -509,46 +526,51 @@ cdef class ElementwiseKernel:
         n_args = len(args)
         if n_args != self.nin and n_args != self.nargs:
             raise TypeError('Wrong number of arguments for %s' % self.name)
+
+        if size is None:
+            size = -1
+
+        # Preprocess
         args = _preprocess_args(args)
 
-        values, shape = _broadcast(args, self.params, size is not None)
-        in_args = values[:self.nin]
-        out_args = values[self.nin:]
+        # Broadcast
+        args, shape = _broadcast(args, self.params, size)
+        in_args = args[:self.nin]
+        out_args = args[self.nin:]
 
+        # Decide parameter dtypes.
         in_ndarray_types = tuple(
             [a.dtype.type if isinstance(a, ndarray) else None
              for a in in_args])
         out_ndarray_types = tuple([a.dtype.type for a in out_args])
 
-        in_types, out_types, types = _decide_params_type(
+        in_types, out_types, types = _decide_param_types(
             self.in_params, self.out_params,
             in_ndarray_types, out_ndarray_types)
 
-        is_size_specified = False
-        if size is not None:
-            shape = size,
-            is_size_specified = True
-
+        # Allocate output args as needed.
         out_args = _get_out_args_with_params(
-            out_args, out_types, shape, self.out_params, is_size_specified)
+            out_args, out_types, shape, self.out_params, size is not None)
         if self.nout == 1:
             ret = out_args[0]
         else:
             ret = tuple(out_args)
 
+        # If the shape is 0-sized, return immediately without any computation
         if 0 in shape:
             return ret
 
-        inout_args = [x if isinstance(x, ndarray) else in_types[i](x)
-                      for i, x in enumerate(in_args)]
-        inout_args += out_args
+        inout_args = in_args + out_args
 
+        # Reduce array dimensions
         if self.reduce_dims:
-            inout_args, shape = _reduce_dims(
-                inout_args, self.params, shape)
+            inout_args, shape = _reduce_dims(inout_args, self.params, shape)
+
+        # Append indexer
         indexer = Indexer(shape)
         inout_args.append(indexer)
 
+        # Compile and launch the kernel
         args_info = _get_args_info(inout_args)
         kern = _get_elementwise_kernel(
             args_info, types, self.params, self.operation,
@@ -632,26 +654,44 @@ cdef bint _check_should_use_min_scalar(list in_args) except *:
 
 
 cdef tuple _guess_routine(str name, dict cache, list ops, list in_args, dtype):
+    """Find the best-matching operation from given dtype or input arguments.
+
+    Args:
+        name: ufunc name. Just used in error message.
+        cache: Cache
+        ops: List of candidate oprations.
+        in_args: Input arguments.
+        dtype: dtype
+
+    Returns:
+        One of the elements in op argument; a 3-element tuple where the first 2
+        elements are input/output dtypes and the last element is the operation
+        code.
+    """
     if dtype is None:
+        # dtype is not given. Guess operation from input arguments.
         use_raw_value = _check_should_use_min_scalar(in_args)
         if use_raw_value:
             in_types = tuple(in_args)
-            op = ()
+            op = None
         else:
             in_types = tuple([i.dtype.type for i in in_args])
-            op = cache.get(in_types, ())
+            op = cache.get(in_types)
 
-        if op is ():
+        if op is None:
+            # Not found in cache
             op = _guess_routine_from_in_types(ops, in_types)
             if not use_raw_value:
                 cache[in_types] = op
     else:
-        op = cache.get(dtype, ())
-        if op is ():
+        # dtype is given. Guess operation from dtype.
+        op = cache.get(dtype)
+        if op is None:
+            # Not found in cache
             op = _guess_routine_from_dtype(ops, dtype)
             cache[dtype] = op
 
-    if op:
+    if op is not None:
         return op
     raise TypeError('Wrong type of arguments for %s' % name)
 
@@ -659,6 +699,16 @@ cdef tuple _guess_routine(str name, dict cache, list ops, list in_args, dtype):
 class ufunc(object):
 
     """Universal function.
+
+    Arguments:
+        name: Kernel name
+        nin:
+        nout:
+        ops: A tuple which specifies the possible dtype combinations. Each
+             element is a 3-element tuple, where first 2 elements are a tuples
+             of input/output dtypes and the last element is the operation code.
+        preamble:
+        doc:
 
     Attributes:
         name (str): The name of the universal function.
@@ -783,6 +833,20 @@ class ufunc(object):
 
 
 cpdef create_ufunc(name, ops, routine=None, preamble='', doc=''):
+    """ Creates ufunc instance.
+
+    Arguments:
+        name: Kernel name
+        ops: A tuple which specifies the possible dtype combinations. Each
+             element can be either a string which represents input-output
+             dtype correspondence (e.g. ''bb->bb'), or a 2-element tuple
+             in which the first element is a string described above, and the
+             second element is the operation code for that dtype combination,
+             which overrides `routine` argument.
+        routine: Default operation code.
+        preamble:
+        doc:
+    """
     _ops = []
     for t in ops:
         if not isinstance(t, tuple):

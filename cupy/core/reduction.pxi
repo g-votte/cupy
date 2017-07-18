@@ -385,7 +385,7 @@ class ReductionKernel(object):
 
         in_args = _preprocess_args(args[:self.nin])
         out_args = _preprocess_args(out_args)
-        in_args, broad_shape = _broadcast(in_args, self.in_params, False)
+        in_args, broad_shape = _broadcast(in_args, self.in_params, -1)
 
         if self.identity is None and 0 in broad_shape:
             raise ValueError(('zero-size array to reduction operation'
@@ -397,7 +397,7 @@ class ReductionKernel(object):
         out_ndarray_types = tuple(
             [a.dtype.type if isinstance(a, ndarray) else None
              for a in out_args])
-        in_types, out_types, types = _decide_params_type(
+        in_types, out_types, types = _decide_param_types(
             self.in_params, self.out_params,
             in_ndarray_types, out_ndarray_types)
 
