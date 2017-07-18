@@ -202,6 +202,10 @@ class _compressed_sparse_matrix(sparse_data._data_matrix):
         end = self.indptr[major + 1]
         answer = cupy.zeros((), self.dtype)
         preamble = '''
+template<typename U>
+__device__ U atomicAdd(U* address, U val) {
+    return ::atomicAdd(address, val);
+}
 #if __CUDA_ARCH__ < 600
 __device__ double atomicAdd(double* address, double val) {
     unsigned long long int* address_as_ull =
