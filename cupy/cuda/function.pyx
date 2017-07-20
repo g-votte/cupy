@@ -8,6 +8,7 @@ from libcpp cimport vector
 
 from cupy.cuda cimport driver
 from cupy.core cimport core
+from cupy.core cimport _carray
 
 
 cdef extern from "cupy_stdint.h" nogil:
@@ -67,8 +68,8 @@ cdef inline CPointer _pointer(x):
         return CPointer()
     if isinstance(x, core.ndarray):
         return (<core.ndarray>x).get_pointer()
-    if isinstance(x, core.Indexer):
-        return (<core.Indexer>x).get_pointer()
+    if isinstance(x, _carray.Indexer):
+        return (<_carray.Indexer>x).get_pointer()
 
     if type(x) not in _pointer_numpy_types:
         if isinstance(x, six.integer_types):

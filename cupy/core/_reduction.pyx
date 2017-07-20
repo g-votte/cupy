@@ -5,6 +5,30 @@ import numpy
 
 from cupy import util
 
+from cupy.cuda cimport function
+
+from cupy.core.core cimport ndarray
+
+from cupy.core._carray cimport CArray
+from cupy.core._carray cimport CIndexer
+from cupy.core._carray cimport Indexer
+from cupy.core.kernel_core cimport KernelGenerator
+from cupy.core.kernel_core cimport ParameterInfo
+from cupy.core.kernel_core cimport ParameterInfo_create_indexer
+from cupy.core.kernel_core cimport ParameterInfo_parse
+from cupy.core.kernel_core cimport RuntimeArgInfo
+from cupy.core.kernel_core cimport RuntimeArgInfo_from_arg
+from cupy.core.kernel_core cimport ParameterList
+from cupy.core.kernel_core cimport compile_with_cache as _compile_with_cache
+from cupy.core.kernel_core cimport preprocess_args as _preprocess_args
+from cupy.core.kernel_core cimport reduce_dims as _reduce_dims
+from cupy.core.kernel_core cimport get_dtype_name as _get_dtype_name
+from cupy.core.kernel_core import parse_param_infos as _parse_param_infos
+from cupy.core.kernel_core import decide_param_types as _decide_param_types
+from cupy.core.kernel_core cimport do_broadcast as _do_broadcast
+from cupy.core.kernel_core cimport get_out_args as _get_out_args
+from cupy.core.kernel_core cimport guess_routine as _guess_routine
+
 
 cpdef str _generate_reduction_class_def(
         str name, int block_size, str reduce_type, ParameterList param_list,
@@ -167,7 +191,7 @@ cpdef function.Function _get_simple_reduction_kernel(
         input_expr=input_expr,
         output_expr=output_expr,
         preamble=preamble)
-    module = <function.Module>compile_with_cache(module_code, options)
+    module = _compile_with_cache(module_code, options)
     return module.get_function(kernel_name)
 
 
@@ -314,7 +338,7 @@ class simple_reduction_function(object):
             self._params, True)
         param_list = ParameterList(
             self._params,
-            tuple([RuntimeArgInfo.from_arg(_) for _ in inout_args]))
+            tuple([RuntimeArgInfo_from_arg(_) for _ in inout_args]))
 
         kern = _get_simple_reduction_function(
             routine, param_list,
@@ -453,7 +477,7 @@ class ReductionKernel(object):
 
         in_args = _preprocess_args(args[:self.nin])
         out_args = _preprocess_args(out_args)
-        in_args, broad_shape = _broadcast(in_args, self.in_params, -1)
+        in_args, broad_shape = _do_broadcast(in_args, self.in_params, -1)
 
         if self.identity is None and 0 in broad_shape:
             raise ValueError(('zero-size array to reduction operation'
@@ -495,7 +519,7 @@ class ReductionKernel(object):
             self.params, self.reduce_dims)
         param_list = ParameterList(
             self.params,
-            tuple([RuntimeArgInfo.from_arg(_) for _ in inout_args]))
+            tuple([RuntimeArgInfo_from_arg(_) for _ in inout_args]))
 
         kern = _get_reduction_kernel(
             param_list, types,

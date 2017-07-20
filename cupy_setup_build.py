@@ -23,6 +23,10 @@ MODULES = [
         'name': 'cuda',
         'file': [
             'cupy.core.core',
+            'cupy.core.kernel_core',
+            'cupy.core._elementwise',
+            'cupy.core._reduction',
+            'cupy.core._carray',
             'cupy.core.flags',
             'cupy.core.internal',
             'cupy.cuda.cublas',

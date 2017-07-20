@@ -1,0 +1,1 @@
+DEF MAX_NDIM = 25

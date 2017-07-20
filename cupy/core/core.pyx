@@ -1,6 +1,7 @@
 # distutils: language = c++
 
 from __future__ import division
+import string
 import sys
 
 import numpy
@@ -8,6 +9,7 @@ import six
 
 import cupy
 from cupy.core import flags
+from cupy import cuda
 from cupy.cuda import stream
 try:
     from cupy.cuda import thrust
@@ -21,10 +23,27 @@ from libcpp cimport vector
 
 from cupy.core cimport internal
 from cupy.cuda cimport cublas
+from cupy.cuda cimport device
 from cupy.cuda cimport function
 from cupy.cuda cimport pinned_memory
 from cupy.cuda cimport runtime
 from cupy.cuda cimport memory
+
+from cupy.core._carray import CArray
+from cupy.core._carray import CIndexer
+from cupy.core._carray import Indexer
+from cupy.core._elementwise import ElementwiseKernel
+from cupy.core._elementwise import create_ufunc
+from cupy.core._elementwise import ufunc
+from cupy.core._reduction import ReductionKernel
+from cupy.core._reduction import simple_reduction_function
+from cupy.core._reduction import create_reduction_func
+from cupy.core.kernel_core import compile_with_cache
+
+from cupy.core._carray cimport CArray as _CArray
+from cupy.core._carray cimport CIndexer as _CIndexer
+from cupy.core._carray cimport Indexer as _Indexer
+from cupy.core.kernel_core cimport get_dtype_name as _get_dtype_name
 
 DEF MAX_NDIM = 25
 
@@ -838,7 +857,7 @@ cdef class ndarray:
 
             kern = _nonzero_kernel(self.dtype, self.ndim, dtype, dtype)
             kern.linear_launch(self.size,
-                               (self.ravel(), Indexer(self.shape),
+                               (self.ravel(), _Indexer(self.shape),
                                 scan_index, dst))
             return tuple([dst[i::self.ndim]
                           for i in range(self.ndim)])
@@ -1669,11 +1688,6 @@ cpdef vector.vector[Py_ssize_t] _get_strides_for_nocopy_reshape(
     return newstrides
 
 
-include "carray.pxi"
-include "elementwise.pxi"
-include "reduction.pxi"
-
-
 # =============================================================================
 # Routines
 # =============================================================================
@@ -1925,7 +1939,7 @@ cpdef ndarray array(obj, dtype=None, bint copy=True, Py_ssize_t ndmin=0):
         src_cpu = numpy.frombuffer(mem, a_cpu.dtype,
                                    a_cpu.size).reshape(a_cpu.shape)
         src_cpu[...] = a_cpu
-        stream = cuda.Stream.null
+        stream = cupy.cuda.Stream.null
         a.set(src_cpu, stream)
         pinned_memory._add_to_watch_list(stream.record(), mem)
     return a

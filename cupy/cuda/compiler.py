@@ -135,6 +135,11 @@ def compile_with_cache(source, options=(), arch=None, cache_dir=None):
         temp_path = tf.name
     shutil.move(temp_path, path)
 
+    with tempfile.NamedTemporaryFile(dir=cache_dir, delete=False) as tf:
+        tf.write(source.encode('utf8'))
+        temp_path = tf.name
+    shutil.move(temp_path, path + '.cu')
+
     mod.load(cubin)
     return mod
 
