@@ -438,7 +438,6 @@ def _SimpleReductionKernel_get_cached_function(
         params, arginfos, _kernel._TypeMap type_map,
         name, block_size, identity, input_expr, output_expr, _preamble,
         options):
-
     return _create_reduction_function(
         name, block_size, reduce_type, params, arginfos, identity,
         map_expr, reduce_expr, post_map_expr,
