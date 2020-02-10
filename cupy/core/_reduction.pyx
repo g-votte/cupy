@@ -395,6 +395,7 @@ cdef class _AbstractReductionKernel:
             block_size = 2 ** block_size_exp
 
             block_stride_exp = trial.suggest_int('block_stride_exp', 0, block_size_exp)
+            #block_stride_exp = trial.suggest_int('block_stride_exp', 0, 4)
             block_stride = 2 ** block_stride_exp
             out_block_num = trial.suggest_int('out_block_num', 1, out_dims)
 
@@ -444,10 +445,11 @@ cdef class _AbstractReductionKernel:
                 n = max(
                     n+1,
                     int(math.ceil(expected_total_time * n / total_time)))
+            print(trial.params)
 
             return total_time / n
 
-        study = optuna.create_study()
+        study = optuna.create_study(study_name=self.name)
         default_block_size, default_block_stride, default_out_block_num = (
             default_params)
         study.enqueue_trial(params={
@@ -455,10 +457,15 @@ cdef class _AbstractReductionKernel:
             'block_stride_exp': int(math.log2(default_block_stride)),
             'out_block_num': default_out_block_num,
         })
+        from cupy.cuda.memory import OutOfMemoryError
         study.optimize(
             objective,
             n_trials=optimize_context.config.max_trials,
-            timeout=optimize_context.config.timeout)
+            timeout=optimize_context.config.timeout,
+            #gc_after_trial=False,
+            catch=(OutOfMemoryError,))
+        import pickle
+        pickle.dump(study, open(self.name + '.dump', 'wb'))
         best = study.best_trial
         return (
             best.user_attrs['block_size'],

@@ -74,6 +74,7 @@ def fit_xp(X, n_clusters, max_iter):
 
 
 def fit_custom(X, n_clusters, max_iter):
+    print('CCCCCCCCCCCCCCCCCC')
     assert X.ndim == 2
 
     n_samples = len(X)
@@ -111,7 +112,7 @@ def draw(X, n_clusters, centers, pred, output):
     plt.savefig(output)
 
 
-def run(gpuid, n_clusters, num, max_iter, use_custom_kernel, output):
+def run(gpuid, n_clusters, num, max_iter, use_custom_kernel, output, timeout):
     cupy.random.seed(100)
     numpy.random.seed(120)
     samples = numpy.random.randn(num, 2)
@@ -124,14 +125,28 @@ def run(gpuid, n_clusters, num, max_iter, use_custom_kernel, output):
     with cupy.cuda.Device(gpuid):
         X_train = cupy.asarray(X_train)
 
-        for _ in range(4):
-            with timer(' GPU '):
-                #if True:
-                with cupyx.optimize(key=run):
+        for _ in range(1):
+            print('AAAAAAAAAAAAA')
+            with cupyx.optimize(key=run, timeout=timeout):
+                # Search phase.
+                if use_custom_kernel:
+                    centers, pred = fit_custom(X_train, n_clusters, max_iter)
+                else:
+                    centers, pred = fit_xp(X_train, n_clusters, max_iter)
+
+                # Exploitation phase.
+                with timer(' Optimized '):
                     if use_custom_kernel:
                         centers, pred = fit_custom(X_train, n_clusters, max_iter)
                     else:
                         centers, pred = fit_xp(X_train, n_clusters, max_iter)
+
+            with timer(' Not Optimized '):
+                #if True:
+                if use_custom_kernel:
+                    centers, pred = fit_custom(X_train, n_clusters, max_iter)
+                else:
+                    centers, pred = fit_xp(X_train, n_clusters, max_iter)
 
             if output is not None:
                 index = numpy.random.choice(10000000, 300, replace=False)
@@ -145,14 +160,16 @@ if __name__ == '__main__':
                         help='ID of GPU.')
     parser.add_argument('--n-clusters', '-n', default=2, type=int,
                         help='number of clusters')
-    parser.add_argument('--num', default=50000000, type=int,
+    parser.add_argument('--num', default=5000000, type=int,
                         help='number of samples')
     parser.add_argument('--max-iter', '-m', default=10, type=int,
                         help='number of iterations')
     parser.add_argument('--use-custom-kernel', action='store_true',
                         default=False, help='use Elementwise kernel')
+    parser.add_argument('--timeout', type=int,
+                        default=10, help='use Elementwise kernel')
     parser.add_argument('--output-image', '-o', default=None, type=str,
                         help='output image file name')
     args = parser.parse_args()
     run(args.gpu_id, args.n_clusters, args.num, args.max_iter,
-        args.use_custom_kernel, args.output_image)
+        args.use_custom_kernel, args.output_image, args.timeout)
