@@ -327,17 +327,16 @@ cdef class _AbstractReductionKernel:
             out_shape = _reduce_dims(out_args, self.out_params, out_shape)
 
         # Calculate the reduction block dimensions.
+        contiguous_size = _get_contiguous_size(
+            in_args, self.in_params, len(in_shape), len(out_shape))
+        block_size, block_stride, out_block_num = _get_block_specs(
+            internal.prod_sequence(in_shape),
+            internal.prod_sequence(out_shape),
+            contiguous_size, -1)
+
+        # Optimize block dimensions dynamically if optimize context is set.
         optimize_context = _optimize._get_current_context()
-        if optimize_context is None:
-            # Calculate manually
-            contiguous_size = _get_contiguous_size(
-                in_args, self.in_params, len(in_shape), len(out_shape))
-            block_size, block_stride, out_block_num = _get_block_specs(
-                internal.prod_sequence(in_shape),
-                internal.prod_sequence(out_shape),
-                contiguous_size, -1)
-        else:
-            # Optimize dynamically
+        if optimize_context is not None:
 
             # Calculate a key unique to the reduction setting.
             contiguous_axes = []
@@ -358,8 +357,10 @@ cdef class _AbstractReductionKernel:
 
             params = optimize_context.get_params(key)
             if params is None:
+                default_params = (block_size, block_stride, out_block_num)
                 params = self._optimize_params(
                     optimize_context,
+                    default_params,
                     in_args, out_args, in_shape, out_shape, type_map,
                     map_expr, reduce_expr, post_map_expr, reduce_type,
                     stream)
@@ -381,6 +382,7 @@ cdef class _AbstractReductionKernel:
     def _optimize_params(
             self,
             optimize_context,
+            default_params,
             in_args, out_args, in_shape, out_shape, type_map,
             map_expr, reduce_expr, post_map_expr, reduce_type,
             stream):
@@ -429,11 +431,16 @@ cdef class _AbstractReductionKernel:
 
             _measure(1)  # warmup
 
+            print("Trial: ", trial.number)
             n = 1
             while True:
                 total_time = _measure(n)
                 if total_time > min_total_time:
                     break
+                if (trial.number > 0
+                        and total_time / n > study.best_trial.value * 2):
+                    print("Reject: ", total_time / n)
+                    break  # Early rejection
                 n = max(
                     n+1,
                     int(math.ceil(expected_total_time * n / total_time)))
@@ -441,6 +448,13 @@ cdef class _AbstractReductionKernel:
             return total_time / n
 
         study = optuna.create_study()
+        default_block_size, default_block_stride, default_out_block_num = (
+            default_params)
+        study.enqueue_trial(params={
+            'block_size_exp': int(math.log2(default_block_size)),
+            'block_stride_exp': int(math.log2(default_block_stride)),
+            'out_block_num': default_out_block_num,
+        })
         study.optimize(
             objective,
             n_trials=optimize_context.config.max_trials,

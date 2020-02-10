@@ -80,7 +80,7 @@ def fit_custom(X, n_clusters, max_iter):
 
     pred = cupy.zeros(n_samples)
 
-    initial_indexes = numpy.random.choice(n_samples, n_clusters, replace=False)
+    initial_indexes = cupy.random.choice(n_samples, n_clusters, replace=False)
     centers = X[initial_indexes]
 
     for _ in range(max_iter):
@@ -112,25 +112,31 @@ def draw(X, n_clusters, centers, pred, output):
 
 
 def run(gpuid, n_clusters, num, max_iter, use_custom_kernel, output):
+    cupy.random.seed(100)
+    numpy.random.seed(120)
     samples = numpy.random.randn(num, 2)
     X_train = numpy.r_[samples + 1, samples - 1]
+    import cupyx
 
-    with timer(' CPU '):
-        centers, pred = fit_xp(X_train, n_clusters, max_iter)
+    #with timer(' CPU '):
+    #    centers, pred = fit_xp(X_train, n_clusters, max_iter)
 
     with cupy.cuda.Device(gpuid):
         X_train = cupy.asarray(X_train)
 
-        with timer(' GPU '):
-            if use_custom_kernel:
-                centers, pred = fit_custom(X_train, n_clusters, max_iter)
-            else:
-                centers, pred = fit_xp(X_train, n_clusters, max_iter)
+        for _ in range(4):
+            with timer(' GPU '):
+                #if True:
+                with cupyx.optimize(key=run):
+                    if use_custom_kernel:
+                        centers, pred = fit_custom(X_train, n_clusters, max_iter)
+                    else:
+                        centers, pred = fit_xp(X_train, n_clusters, max_iter)
 
-        if output is not None:
-            index = numpy.random.choice(10000000, 300, replace=False)
-            draw(X_train[index].get(), n_clusters, centers.get(),
-                 pred[index].get(), output)
+            if output is not None:
+                index = numpy.random.choice(10000000, 300, replace=False)
+                draw(X_train[index].get(), n_clusters, centers.get(),
+                     pred[index].get(), output)
 
 
 if __name__ == '__main__':
@@ -139,7 +145,7 @@ if __name__ == '__main__':
                         help='ID of GPU.')
     parser.add_argument('--n-clusters', '-n', default=2, type=int,
                         help='number of clusters')
-    parser.add_argument('--num', default=5000000, type=int,
+    parser.add_argument('--num', default=50000000, type=int,
                         help='number of samples')
     parser.add_argument('--max-iter', '-m', default=10, type=int,
                         help='number of iterations')
