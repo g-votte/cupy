@@ -35,7 +35,7 @@ class _OptimizationConfig:
     def __init__(
             self, *,
             max_trials=100,
-            timeout=1,
+            timeout=100,
             expected_total_time_per_trial=100 * 1e-6,
             min_total_time_per_trial=90 * 1e-6,
     ):

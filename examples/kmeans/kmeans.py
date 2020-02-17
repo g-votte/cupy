@@ -87,7 +87,10 @@ def fit_custom(X, n_clusters, max_iter):
     initial_indexes = cupy.random.choice(n_samples, n_clusters, replace=False)
     centers = X[initial_indexes]
 
+    n_iter = 0
     for _ in range(max_iter):
+        n_iter += 1
+
         distances = var_kernel(X[:, None, 0], X[:, None, 1],
                                centers[None, :, 1], centers[None, :, 0])
         new_pred = cupy.argmin(distances, axis=1)
@@ -100,6 +103,8 @@ def fit_custom(X, n_clusters, max_iter):
         sums = sum_kernel(X, mask[:, :, None], axis=1)
         counts = count_kernel(mask, axis=1).reshape((n_clusters, 1))
         centers = sums / counts
+
+    print('Number of iterations: {}'.format(n_iter))
 
     return centers, pred
 
@@ -115,7 +120,7 @@ def draw(X, n_clusters, centers, pred, output):
     plt.savefig(output)
 
 
-def run(gpuid, n_clusters, num, max_iter, use_custom_kernel, output):
+def run(gpuid, n_clusters, num, max_iter, use_custom_kernel, output, timeout, use_optimize):
     cupy.random.seed(100)
     numpy.random.seed(120)
     samples = numpy.random.randn(num, 2)
@@ -131,7 +136,13 @@ def run(gpuid, n_clusters, num, max_iter, use_custom_kernel, output):
         for _ in range(4):
             with timer(' GPU '):
                 #if True:
-                with cupyx.optimize(key=run):
+                if use_optimize:
+                    with cupyx.optimize(key=run):
+                        if use_custom_kernel:
+                            centers, pred = fit_custom(X_train, n_clusters, max_iter)
+                        else:
+                            centers, pred = fit_xp(X_train, n_clusters, max_iter)
+                else:
                     if use_custom_kernel:
                         centers, pred = fit_custom(X_train, n_clusters, max_iter)
                     else:
@@ -157,6 +168,13 @@ if __name__ == '__main__':
                         default=False, help='use Elementwise kernel')
     parser.add_argument('--output-image', '-o', default=None, type=str,
                         help='output image file name')
+
+    # Options for optuna benchmark.
+    parser.add_argument('--timeout', default=100, type=int,
+                        help='timeout of optimize')
+    parser.add_argument('--use-optimize', action='store_true',
+                        default=False, help='use cupyx.optimize')
+
     args = parser.parse_args()
     run(args.gpu_id, args.n_clusters, args.num, args.max_iter,
-        args.use_custom_kernel, args.output_image)
+        args.use_custom_kernel, args.output_image, args.timeout, args.use_optimize)
