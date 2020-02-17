@@ -137,7 +137,7 @@ def run(gpuid, n_clusters, num, max_iter, use_custom_kernel, output, timeout, us
             with timer(' GPU '):
                 #if True:
                 if use_optimize:
-                    with cupyx.optimize(key=run):
+                    with cupyx.optimize(key=run, timeout=timeout):
                         if use_custom_kernel:
                             centers, pred = fit_custom(X_train, n_clusters, max_iter)
                         else:
