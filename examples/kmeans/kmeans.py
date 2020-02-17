@@ -174,6 +174,8 @@ if __name__ == '__main__':
                         help='timeout of optimize')
     parser.add_argument('--use-optimize', action='store_true',
                         default=False, help='use cupyx.optimize')
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     args = parser.parse_args()
     run(args.gpu_id, args.n_clusters, args.num, args.max_iter,
