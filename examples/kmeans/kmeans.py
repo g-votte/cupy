@@ -120,7 +120,8 @@ def draw(X, n_clusters, centers, pred, output):
     plt.savefig(output)
 
 
-def run(gpuid, n_clusters, num, max_iter, use_custom_kernel, output, timeout, use_optimize):
+def run(gpuid, n_clusters, num, max_iter, use_custom_kernel, output, timeout,
+        use_optimize, gc_after_trial):
     cupy.random.seed(100)
     numpy.random.seed(120)
     samples = numpy.random.randn(num, 2)
@@ -137,7 +138,8 @@ def run(gpuid, n_clusters, num, max_iter, use_custom_kernel, output, timeout, us
             with timer(' GPU '):
                 #if True:
                 if use_optimize:
-                    with cupyx.optimize(key=run, timeout=timeout):
+                    with cupyx.optimize(key=run, timeout=timeout,
+                                        gc_after_trial=gc_after_trial):
                         if use_custom_kernel:
                             centers, pred = fit_custom(X_train, n_clusters, max_iter)
                         else:
@@ -174,9 +176,12 @@ if __name__ == '__main__':
                         help='timeout of optimize')
     parser.add_argument('--use-optimize', action='store_true',
                         default=False, help='use cupyx.optimize')
+    parser.add_argument('--disable-gc', action='store_true',
+                        default=False, help='disable GC after each trial')
     import optuna
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     args = parser.parse_args()
     run(args.gpu_id, args.n_clusters, args.num, args.max_iter,
-        args.use_custom_kernel, args.output_image, args.timeout, args.use_optimize)
+        args.use_custom_kernel, args.output_image, args.timeout,
+        args.use_optimize, not args.disable_gc)

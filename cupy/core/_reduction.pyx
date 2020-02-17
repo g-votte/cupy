@@ -457,8 +457,14 @@ cdef class _AbstractReductionKernel:
         study.optimize(
             objective,
             n_trials=optimize_context.config.max_trials,
-            timeout=optimize_context.config.timeout)
+            timeout=optimize_context.config.timeout,
+            gc_after_trial=optimize_context.config.gc_after_trial)
         best = study.best_trial
+
+        # Saving study for debug purpose.
+        import pickle
+        pickle.dump(study, open('study.dump', 'wb'))
+
         return (
             best.user_attrs['block_size'],
             best.user_attrs['block_stride'],
