@@ -431,7 +431,6 @@ cdef class _AbstractReductionKernel:
 
             _measure(1)  # warmup
 
-            print("Trial: ", trial.number)
             n = 1
             while True:
                 total_time = _measure(n)
