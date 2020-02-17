@@ -463,7 +463,7 @@ cdef class _AbstractReductionKernel:
 
         # Saving study for debug purpose.
         import pickle
-        pickle.dump(study, open('study.dump', 'wb'))
+        pickle.dump(study, open('{}.dump'.format(self.name), 'wb'))
 
         return (
             best.user_attrs['block_size'],
