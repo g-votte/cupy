@@ -174,8 +174,8 @@ if __name__ == '__main__':
     # Options for optuna benchmark.
     parser.add_argument('--timeout', default=100, type=int,
                         help='timeout of optimize')
-    parser.add_argument('--use-optimize', action='store_true',
-                        default=False, help='use cupyx.optimize')
+    parser.add_argument('--disable-optimize', action='store_true',
+                        default=False, help='disable cupyx.optimize')
     parser.add_argument('--disable-gc', action='store_true',
                         default=False, help='disable GC after each trial')
     import optuna
@@ -184,4 +184,4 @@ if __name__ == '__main__':
     args = parser.parse_args()
     run(args.gpu_id, args.n_clusters, args.num, args.max_iter,
         args.use_custom_kernel, args.output_image, args.timeout,
-        args.use_optimize, not args.disable_gc)
+        not args.disable_optimize, not args.disable_gc)
