@@ -52,7 +52,9 @@ def fit_xp(X, n_clusters, max_iter):
     initial_indexes = numpy.random.choice(n_samples, n_clusters, replace=False)
     centers = X[initial_indexes]
 
+    n_iter = 0
     for _ in range(max_iter):
+        n_iter += 1
         # Compute the new label for each sample.
         distances = xp.linalg.norm(X[:, None, :] - centers[None, :, :], axis=2)
         new_pred = xp.argmin(distances, axis=1)
@@ -69,6 +71,8 @@ def fit_xp(X, n_clusters, max_iter):
         sums = xp.where(mask[:, :, None], X, 0).sum(axis=1)
         counts = xp.count_nonzero(mask, axis=1).reshape((n_clusters, 1))
         centers = sums / counts
+
+    print('Number of iterations: {}'.format(n_iter))
 
     return centers, pred
 
@@ -145,7 +149,7 @@ if __name__ == '__main__':
                         help='ID of GPU.')
     parser.add_argument('--n-clusters', '-n', default=2, type=int,
                         help='number of clusters')
-    parser.add_argument('--num', default=50000000, type=int,
+    parser.add_argument('--num', default=5000000, type=int,
                         help='number of samples')
     parser.add_argument('--max-iter', '-m', default=10, type=int,
                         help='number of iterations')
